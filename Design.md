@@ -2,7 +2,9 @@
 
 ## 1. What This Is
 
-A terminal-resident AI agent that operates in a **think → plan → act → observe → retry** loop. It reads your codebase, runs shell commands, writes and edits files, and self-corrects when things break — all from a single terminal session. No GUI, no browser, no hand-holding.
+A terminal-resident AI agent that operates in a **think → plan → act → observe → retry** loop. It reads your codebase, runs shell commands, writes and edits files, and self-corrects when things break — all from a single terminal session.
+
+**Key differentiator:** Intelligent multi-model routing. The agent automatically picks the cheapest model that can handle each task, escalating to premium models only when needed. A typical coding session costs $0.01–0.05 instead of $2–5 on Claude Code or Codex.
 
 ---
 
@@ -12,8 +14,8 @@ The entire agent is one recursive control loop:
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                   USER PROMPT                       │
-└──────────────────────┬──────────────────────────────┘
+│                   USER PROMPT                        │
+└──────────────────────┬───────────────────────────────┘
                        ▼
               ┌────────────────┐
               │     THINK      │  LLM decides intent + plan
@@ -58,7 +60,8 @@ cli-agent/
 │   ├── core.py              # The main agent loop (think-plan-act-observe)
 │   ├── planner.py           # Prompt construction + LLM call
 │   ├── context.py           # Context window manager (token budget)
-│   └── memory.py            # Conversation history + summarization
+│   ├── memory.py            # Conversation history + summarization
+│   └── snapshots.py         # Session replay / time-travel checkpoints
 ├── tools/
 │   ├── registry.py          # Tool registry (discover, validate, dispatch)
 │   ├── shell.py             # Execute shell commands
@@ -72,14 +75,23 @@ cli-agent/
 │   └── permissions.py       # Allowlist / blocklist for dangerous commands
 ├── llm/
 │   ├── provider.py          # Abstract LLM interface
-│   ├── ollama_provider.py   # Ollama (local — GLM4, Qwen, Llama, etc.)
-│   ├── anthropic_provider.py# Claude API
-│   └── openai_provider.py   # OpenAI-compatible API (optional)
+│   ├── router.py            # Smart model router (cheap → expensive escalation)
+│   ├── gemini_provider.py   # Google Gemini API (default — free tier)
+│   ├── deepseek_provider.py # DeepSeek API (cheap production workhorse)
+│   ├── anthropic_provider.py# Claude API (premium fallback)
+│   └── openai_compat.py     # OpenAI-compatible wrapper (Ollama, OpenRouter, etc.)
+├── cost/
+│   ├── tracker.py           # Per-session and cumulative cost tracking
+│   ├── pricing.py           # Model pricing table (auto-updated)
+│   └── budget.py            # Budget limits and alerts
+├── project/
+│   ├── memory.py            # Persistent project memory (.agent/memory.json)
+│   └── patterns.py          # Error pattern learning DB
 ├── config/
 │   ├── settings.py          # Pydantic settings (env vars, defaults)
 │   └── default.toml         # Default config file
 └── utils/
-    ├── tokens.py            # Token counting (tiktoken / approximate)
+    ├── tokens.py            # Token counting (tiktoken)
     ├── diff.py              # Unified diff generation for edits
     └── logger.py            # Structured logging (JSON lines)
 ```
@@ -90,26 +102,139 @@ cli-agent/
 
 | Layer | Choice | Why |
 |---|---|---|
-| **Language** | Python 3.11+ | You already live here. Async support, rich ecosystem. |
-| **LLM (local)** | Ollama — **Qwen 3.5 4B** (`qwen3.5:4b`) | 3.4GB Q4_K_M. Native tool calling + thinking support in Ollama. 256K context window. Apache 2.0. |
-| **LLM (remote)** | Claude Sonnet via API | Fallback for complex multi-step tasks where 4B struggles. |
+| **Language** | Python 3.11+ | Async support, rich ecosystem, you live here already. |
+| **LLM (default)** | Gemini 2.0 Flash | Free tier: 15 RPM, 1000 req/day. Good tool calling. Zero cost during development. |
+| **LLM (production)** | DeepSeek V3.2 | $0.28/$0.42 per 1M tokens. 90% cache discount. Best price-to-quality for code tasks. |
+| **LLM (premium)** | Claude Sonnet 4.6 | $3/$15 per 1M tokens. Escalation-only for complex multi-file reasoning. |
 | **CLI framework** | `click` + `rich` | Click for arg parsing, Rich for pretty terminal output (spinners, syntax highlighting, panels). |
 | **Config** | Pydantic Settings + TOML | Type-safe config, env var overrides, sensible defaults. |
 | **Subprocess** | `asyncio.create_subprocess_exec` | Non-blocking command execution with timeout control. |
-| **Token counting** | `tiktoken` (or character heuristic for local models) | Manage context window budget. |
+| **Token counting** | `tiktoken` | Accurate counts for cost tracking and context budget. |
+| **HTTP client** | `httpx` (async) | Non-blocking API calls. Connection pooling. Retry with backoff. |
 | **Logging** | `structlog` | JSON-lines structured logs. Debug an agent's decisions after the fact. |
 
-**No database. No server. No Docker.** It's a CLI tool that runs in your terminal. State lives in memory for the session and optionally dumps to a `.jsonl` log file.
+**No database. No server. No Docker.** It's a CLI tool. State lives in memory for the session, persists project memory to `.agent/`, and dumps debug logs to `.jsonl`.
 
 ---
 
-## 5. Tool System Design
+## 5. Multi-Model Router (The Cost Engine)
+
+This is the core differentiator. Every other CLI agent uses one model for everything. Yours routes intelligently.
+
+### 5.1 Three-Tier Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     MODEL ROUTER                            │
+│                                                             │
+│  Tier 1: FREE (Gemini Flash)         ← 70% of calls        │
+│  Simple reads, grep, glob, single-file edits, shell cmds   │
+│  Cost: $0.00                                                │
+│                                                             │
+│  Tier 2: CHEAP (DeepSeek V3.2)       ← 25% of calls        │
+│  Multi-file edits, complex debugging, code generation       │
+│  Cost: ~$0.001 per call                                     │
+│                                                             │
+│  Tier 3: PREMIUM (Claude Sonnet)     ← 5% of calls         │
+│  Architecture decisions, cross-module refactors, stuck loops│
+│  Cost: ~$0.02 per call                                      │
+│                                                             │
+│  Typical session (30 tool calls): $0.01 – $0.05             │
+│  Same session on Claude Code:        $2.00 – $5.00          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 Routing Logic
+
+```python
+class ModelRouter:
+    def select_model(self, task_context: dict) -> Provider:
+        """
+        Route to the cheapest model that can handle the task.
+        Escalation is based on OBSERVED failure, not predicted difficulty.
+        """
+        # Always start at Tier 1
+        if self.consecutive_failures == 0:
+            return self.tier1  # Gemini Flash
+
+        # Escalate to Tier 2 after 2 consecutive failures
+        # (malformed tool calls, wrong tool choice, bad edits)
+        if self.consecutive_failures >= 2:
+            return self.tier2  # DeepSeek
+
+        # Escalate to Tier 3 after 2 more failures on Tier 2
+        if self.tier2_failures >= 2:
+            return self.tier3  # Claude Sonnet
+
+    def on_success(self):
+        """Reset failure counter on any successful tool execution."""
+        self.consecutive_failures = 0
+        self.tier2_failures = 0
+
+    def on_failure(self, tier: int):
+        """Track failures per tier."""
+        if tier == 1:
+            self.consecutive_failures += 1
+        elif tier == 2:
+            self.tier2_failures += 1
+```
+
+**Transparency:** The agent ALWAYS shows which model it's using:
+```
+[gemini-flash] Reading src/main.py...
+[gemini-flash] Editing src/main.py — replacing DB connection logic...
+[gemini-flash] Running pytest... FAILED
+[gemini-flash] Retrying fix... FAILED
+[↑ deepseek] Escalating — 2 consecutive failures.
+[deepseek] Reading error trace more carefully...
+[deepseek] The issue is a missing import in src/db.py...
+```
+
+### 5.3 Cost Tracking
+
+```python
+class CostTracker:
+    def __init__(self):
+        self.session_cost = 0.0
+        self.session_calls = {"gemini": 0, "deepseek": 0, "claude": 0}
+        self.cumulative_file = Path.home() / ".cli-agent" / "costs.jsonl"
+
+    def record(self, provider: str, input_tokens: int, output_tokens: int):
+        cost = self.calculate(provider, input_tokens, output_tokens)
+        self.session_cost += cost
+        self.session_calls[provider] += 1
+
+        # Check budget limit
+        if self.session_cost > self.budget_limit:
+            raise BudgetExceeded(f"Session cost ${self.session_cost:.4f} exceeds limit")
+
+    def summary(self) -> str:
+        """Show at end of session or on /cost command."""
+        return (
+            f"Session cost: ${self.session_cost:.4f}\n"
+            f"Calls: {self.session_calls}\n"
+            f"Avg cost/call: ${self.session_cost / sum(self.session_calls.values()):.6f}"
+        )
+```
+
+Displayed at end of every session:
+```
+────────────────────────────────────────
+Session complete.
+  Cost:   $0.0034
+  Calls:  gemini: 8, deepseek: 2, claude: 0
+  Tokens: 12,340 in / 4,210 out
+────────────────────────────────────────
+```
+
+---
+
+## 6. Tool System Design
 
 Every tool is a Python class that implements one interface:
 
 ```python
 from dataclasses import dataclass
-from typing import Any
 
 @dataclass
 class ToolResult:
@@ -131,7 +256,7 @@ class BaseTool:
         ...
 ```
 
-### 5.1 Tool Definitions
+### 6.1 Tool Definitions
 
 **shell** — Execute a command.
 ```
@@ -178,7 +303,7 @@ args: {query: str, path: str = ".", include: str = None}
 returns: {matches: list[{file, line_number, content}]}
 ```
 
-### 5.2 Tool Registry
+### 6.2 Tool Registry
 
 ```python
 class ToolRegistry:
@@ -187,7 +312,7 @@ class ToolRegistry:
     def register(self, tool: BaseTool): ...
     def get(self, name: str) -> BaseTool: ...
     def schema_for_llm(self) -> list[dict]:
-        """Return all tool schemas in OpenAI/Anthropic function-calling format."""
+        """Return all tool schemas in OpenAI function-calling format."""
         ...
 ```
 
@@ -195,20 +320,21 @@ The registry auto-generates the tools section of the system prompt. When you add
 
 ---
 
-## 6. Context Window Management
-
-This is where most DIY agents fail. You will hit the context limit. Plan for it.
+## 7. Context Window Management
 
 ```
 ┌──────────────────── CONTEXT BUDGET ────────────────────┐
 │                                                        │
-│  [SYSTEM PROMPT]           ~1500 tokens (fixed)        │
-│  [TOOL DEFINITIONS]        ~800 tokens (fixed)         │
-│  [PROJECT CONTEXT]         ~2000 tokens (dynamic)      │
+│  [SYSTEM PROMPT]           ~800 tokens (fixed)         │
+│  [TOOL DEFINITIONS]        ~600 tokens (fixed)         │
+│  [PROJECT MEMORY]          ~500 tokens (loaded once)   │
 │  [CONVERSATION HISTORY]    remaining budget (sliding)   │
 │  [CURRENT OBSERVATION]     last tool result             │
 │                                                        │
-│  TOTAL BUDGET: model_max_tokens - max_output_tokens    │
+│  BUDGET: model_context_window - max_output_tokens      │
+│  Gemini Flash: 1M (but target 32K effective)           │
+│  DeepSeek: 128K (target 32K effective)                 │
+│  Claude Sonnet: 200K (target 64K effective)            │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -218,32 +344,34 @@ This is where most DIY agents fail. You will hit the context limit. Plan for it.
 class ContextManager:
     def __init__(self, max_tokens: int, reserve_output: int = 4096):
         self.budget = max_tokens - reserve_output
-        self.system_prompt: str           # Fixed
-        self.tool_schemas: str            # Fixed
-        self.project_context: str         # Semi-fixed (tree, key files)
-        self.history: list[Message]       # Sliding window
-        self.summaries: list[str]         # Compressed old history
+        self.system_prompt: str
+        self.tool_schemas: str
+        self.project_memory: str         # Loaded from .agent/memory.json
+        self.history: list[Message]
+        self.summaries: list[str]
 
     def build_messages(self) -> list[dict]:
         """Assemble messages that fit within budget."""
-        fixed_cost = count_tokens(self.system_prompt + self.tool_schemas + self.project_context)
+        fixed_cost = count_tokens(self.system_prompt + self.tool_schemas + self.project_memory)
         remaining = self.budget - fixed_cost
 
         # Take messages from the end (most recent first)
-        # When history exceeds budget: summarize oldest N messages into one summary block
+        # When history exceeds budget: summarize oldest N messages into one block
         ...
 ```
 
-**Rules (tuned for 4B):**
-1. Never send raw files over 200 lines. Always read with line ranges. (Tighter than larger models.)
-2. Truncate tool output to 20KB. Last 100 lines for errors, first 50 for file reads.
-3. When history grows past 50% of budget, summarize the oldest third into a single "so far" block.
+**Rules:**
+1. Never send raw files over 500 lines. Always read with line ranges.
+2. Truncate tool output to 50KB. Let the LLM re-read specific sections.
+3. When history grows past 60% of budget, summarize the oldest third into a single "so far" block.
 4. Always keep the last 2 user messages + last 2 tool results intact (no summarization).
-5. Effective context budget: target 8–16K tokens even though 256K is available. Quality > quantity at 4B.
+5. Use the *effective* context target (32K), not the model's max. Cheaper on tokens, better quality.
 
 ---
 
-## 7. LLM Provider Abstraction
+## 8. LLM Provider Abstraction
+
+All providers implement the same interface. The router sits on top.
 
 ```python
 from abc import ABC, abstractmethod
@@ -255,8 +383,13 @@ class LLMResponse:
     tool_calls: list[ToolCall] | None # Structured tool calls
     usage: dict                       # {prompt_tokens, completion_tokens}
     stop_reason: str                  # "end_turn", "tool_use", etc.
+    model: str                        # Which model actually ran
+    cost: float                       # Calculated cost for this call
 
 class LLMProvider(ABC):
+    name: str                         # "gemini", "deepseek", "claude"
+    tier: int                         # 1, 2, or 3
+
     @abstractmethod
     async def complete(
         self,
@@ -266,93 +399,82 @@ class LLMProvider(ABC):
     ) -> LLMResponse:
         ...
 
-class OllamaProvider(LLMProvider):
+class GeminiProvider(LLMProvider):
     """
-    POST to http://localhost:11434/api/chat
+    Google Generative AI API.
+    - Free tier: 15 RPM, 1000 requests/day
+    - Tool calling via function_declarations
+    - 1M context window
+    """
+    name = "gemini"
+    tier = 1
 
-    Qwen 3.5 4B specifics:
-    - Thinking mode is OFF by default for small models. Enable it:
-      Option A: In the API call, set "think": true in options
-      Option B: Create a Modelfile with PARAMETER think true
-    - Tool calling format: Ollama native (compatible with OpenAI function-calling schema)
-    - Force ONE tool call per turn (set "parallel_tool_calls": false or parse only the first)
-    - At 4B, expect ~15-20% malformed tool call rate. Always validate JSON before executing.
-    - 256K context window, but keep effective usage under 8-16K for speed + coherence.
+class DeepSeekProvider(LLMProvider):
     """
-    ...
+    OpenAI-compatible API at https://api.deepseek.com
+    - $0.28/1M input, $0.42/1M output (90% cache discount)
+    - Native tool calling
+    - 128K context window
+    """
+    name = "deepseek"
+    tier = 2
 
 class AnthropicProvider(LLMProvider):
-    """POST to https://api.anthropic.com/v1/messages"""
-    ...
-```
+    """
+    Anthropic Messages API.
+    - $3/1M input, $15/1M output
+    - Best tool calling reliability
+    - 200K context window
+    """
+    name = "claude"
+    tier = 3
 
-**Model routing logic** (important at 4B — not optional):
-- Start with Qwen 3.5 4B for every request.
-- Track: did the model produce a valid tool call JSON? If it fails JSON validation 2x in a row, escalate to Claude.
-- If the task requires >3 retries (actual execution failures, not parse failures), escalate to Claude.
-- Log which model handled what for later analysis.
+class OpenAICompatProvider(LLMProvider):
+    """
+    Generic OpenAI-compatible wrapper.
+    Works with: Ollama (local), OpenRouter, Together, Groq, etc.
+    Configure via base_url + api_key.
+    """
+    name = "custom"
+    tier = 1  # configurable
+```
 
 ---
 
-## 8. Qwen 3.5 4B — Design Constraints
-
-Running a 4B model as an agent brain means working within tight limits. These aren't suggestions — ignore them and the agent will feel broken.
-
-**1. Enable thinking mode.**
-Small Qwen 3.5 models ship with thinking off. Without it, the model jumps straight to a tool call without reasoning about what it should do. For an agent, that's fatal — it'll read the wrong file, run the wrong command, fix the wrong thing. Enable it via the Ollama API (`"think": true`) or a custom Modelfile (`PARAMETER think true`).
-
-**2. One tool call per turn. Always.**
-Don't let the model emit multiple tool calls in a single response. Parse only the first tool_call from the response. Multi-tool planning requires working memory that 4B doesn't reliably have.
-
-**3. Max 6 tools.**
-The 6 tools in this design (shell, file_read, file_write, file_edit, glob_search, grep_search) are the ceiling. If you need more capability, compose it — e.g., don't add a "run_tests" tool, just let the agent call `shell` with `pytest`. Every tool in the schema is a decision the model has to make, and at 4B, decision quality degrades fast past 6 options.
-
-**4. System prompt under 800 tokens.**
-4B models lose instruction-following quality as the system prompt grows. Cut every word that isn't a hard rule. No examples in the system prompt — if the model needs examples, put them in a few-shot format in the first user message instead.
-
-**5. Tool output truncation is mandatory.**
-At 4B, long context ≠ good context. Even though Qwen 3.5 supports 256K, keep effective context under 8–16K tokens. Truncate tool output aggressively (last 100 lines for errors, first 50 lines for file reads). The model's attention degrades on long inputs.
-
-**6. Validate tool call JSON before execution.**
-Budget for ~15–20% malformed tool calls. The validation layer should:
-- Check that `tool_name` exists in the registry.
-- Check that all required args are present and typed correctly.
-- If invalid: append a short error ("Invalid tool call: missing 'path' argument") to context and re-prompt. Don't burn a retry cycle on this — it's a parse error, not a logic error.
-
-**7. Keep conversation history short.**
-Summarize aggressively. At 4B, the model starts contradicting its own earlier reasoning after ~6–8 turns. The summarize threshold in the context manager should be set to 50% (not 60% like larger models).
-
----
-
-## 8. The System Prompt
-
-This is 60% of your agent's quality. For a 4B model, **keep it under 800 tokens**. No fluff.
+## 9. The System Prompt
 
 ```
-You are a CLI coding agent. You use tools to read files, edit code, and run commands.
+You are an autonomous coding agent running in a terminal.
+You have access to tools to interact with the filesystem and shell.
 
-RULES:
-1. Read a file before editing it. Never guess contents.
-2. Run code after changes to verify.
-3. On error: read the error, fix root cause, re-run.
-4. Use grep/glob to find files before assuming paths.
-5. Never run destructive commands (rm -rf, drop, etc.) without asking.
-6. One tool call per response. No parallel calls.
-7. After 3 failed fixes, stop and ask the user.
+## Rules
+- ALWAYS read a file before editing it. Never guess at contents.
+- ALWAYS run the code after making changes to verify it works.
+- When a command fails, read the error carefully. Fix the root cause, not symptoms.
+- If you're unsure, search the codebase first (grep/glob) before making assumptions.
+- Never run destructive commands (rm -rf, drop database, etc.) without user confirmation.
+- Explain what you're about to do before doing it.
+- After 3 failed attempts at the same fix, stop and ask the user for help.
 
-WORKFLOW: Understand → Search → Read → Edit → Verify → Report.
+## Working Style
+1. Understand the request fully.
+2. Explore the relevant code (read, grep, glob).
+3. Plan the changes.
+4. Make the changes (edit/write).
+5. Verify (run tests, execute code).
+6. If broken, read error, fix, re-verify.
+7. Report the result.
 
-TOOLS:
+## Project Context
+{loaded from .agent/memory.json if it exists}
+
+## Available Tools
 {auto-generated from tool registry}
 ```
 
-That's it. Resist the urge to add more. Every extra sentence in the system prompt is a sentence the 4B model might forget mid-task.
-
 ---
 
-## 9. Error Recovery (The Self-Fix Loop)
-
-This is where "autonomous" actually matters:
+## 10. Error Recovery (The Self-Fix Loop)
 
 ```python
 async def act_and_recover(self, action: ToolCall, max_retries: int = 3) -> ToolResult:
@@ -360,6 +482,10 @@ async def act_and_recover(self, action: ToolCall, max_retries: int = 3) -> ToolR
         result = await self.execute_tool(action)
 
         if result.success:
+            self.router.on_success()
+            # Learn the pattern if this was a fix for a previous error
+            if attempt > 0:
+                self.patterns.learn(previous_error, action, result)
             return result
 
         # Feed failure back into context
@@ -368,15 +494,23 @@ async def act_and_recover(self, action: ToolCall, max_retries: int = 3) -> ToolR
             f"{result.output}"
         )
 
-        # Ask the LLM to diagnose and produce a new action
-        recovery = await self.planner.get_next_action(
-            self.context.build_messages()
-        )
+        # Check pattern DB first — skip LLM if we've seen this before
+        known_fix = self.patterns.match(result.output)
+        if known_fix:
+            action = known_fix.to_tool_call()
+            continue
+
+        # Notify router of failure (may trigger model escalation)
+        self.router.on_failure(self.current_provider.tier)
+
+        # Ask the (potentially upgraded) LLM to diagnose
+        provider = self.router.select_model(self.context)
+        recovery = await provider.complete(self.context.build_messages())
 
         if recovery.content and not recovery.tool_calls:
-            # LLM gave up and wrote an explanation — surface to user
             return ToolResult(output=recovery.content, success=False, metadata={})
 
+        previous_error = result.output
         action = recovery.tool_calls[0]
 
     return ToolResult(
@@ -386,20 +520,148 @@ async def act_and_recover(self, action: ToolCall, max_retries: int = 3) -> ToolR
     )
 ```
 
-**What makes this work:** The error output (stderr, traceback, exit code) goes directly into the LLM context as an observation. The LLM sees what went wrong and can course-correct — different fix, read more context, try a different approach entirely.
+**What makes this different from other agents:** Two things. First, the error pattern DB catches known errors without burning an API call. Second, when a retry does need the LLM, it doesn't re-ask the same model — it escalates to a smarter one that gets a fresh look at the full context.
 
 ---
 
-## 10. Safety & Sandboxing
+## 11. Differentiating Features
+
+### 11.1 Session Replay & Time Travel
+
+No agent lets you rewind. When the agent makes 5 changes and something breaks at step 3, you're stuck.
+
+```python
+class SnapshotManager:
+    """Checkpoint file state before every edit. Enable /rewind N."""
+
+    def __init__(self, snapshot_dir: Path = Path(".agent/snapshots")):
+        self.snapshot_dir = snapshot_dir
+        self.snapshots: list[Snapshot] = []
+
+    def checkpoint(self, step: int, files_affected: list[str]):
+        """Copy affected files to .agent/snapshots/{step}/ before editing."""
+        step_dir = self.snapshot_dir / str(step)
+        step_dir.mkdir(parents=True, exist_ok=True)
+        for f in files_affected:
+            shutil.copy2(f, step_dir / Path(f).name)
+        self.snapshots.append(Snapshot(step=step, files=files_affected, timestamp=now()))
+
+    def rewind(self, to_step: int):
+        """Restore all files to their state at step N."""
+        snapshot = self.snapshots[to_step]
+        for f in snapshot.files:
+            src = self.snapshot_dir / str(to_step) / Path(f).name
+            shutil.copy2(src, f)
+```
+
+User experience:
+```
+> /rewind 3
+Restored 2 files to state at step 3 (before "fix auth middleware").
+Steps 4, 5 undone.
+```
+
+### 11.2 Project Memory (Persistent Across Sessions)
+
+Other agents start fresh every time. Yours remembers the project.
+
+```json
+// .agent/memory.json — auto-maintained, user-editable
+{
+    "project": {
+        "name": "neosutra",
+        "language": "python",
+        "framework": "fastapi",
+        "test_runner": "pytest",
+        "key_files": {
+            "config": "config/database.py",
+            "entry": "src/main.py",
+            "models": "src/models/"
+        }
+    },
+    "learned": [
+        "Uses pgvector for embeddings",
+        "DB migrations via alembic",
+        "Auth tokens are in src/auth/jwt.py"
+    ],
+    "last_session": {
+        "date": "2026-03-23",
+        "summary": "Fixed RAG pipeline chunking. Tests passing.",
+        "files_touched": ["src/pipeline/chunker.py", "tests/test_chunker.py"]
+    }
+}
+```
+
+On startup, this gets loaded into the system prompt's project context section. The agent knows what it worked on last time without you re-explaining.
+
+**Auto-learn:** After each session, the agent appends new discoveries (detected test runner, key config paths, patterns found) to memory. User can review/edit with `/memory` command.
+
+### 11.3 Error Pattern DB
+
+When the agent fixes an error, log the pattern. Next time, check locally before calling the LLM.
+
+```python
+class PatternDB:
+    """Local pattern matching — skip LLM calls for known fixes."""
+
+    def __init__(self, db_path: Path = Path(".agent/patterns.json")):
+        self.patterns: list[ErrorPattern] = self.load(db_path)
+
+    def match(self, error_output: str) -> ErrorPattern | None:
+        """Check if this error matches a previously solved pattern."""
+        for pattern in self.patterns:
+            if pattern.signature in error_output:
+                return pattern
+        return None
+
+    def learn(self, error_output: str, fix_applied: str, file_context: str):
+        """Record a successful error → fix mapping."""
+        signature = self.extract_signature(error_output)
+        self.patterns.append(ErrorPattern(
+            signature=signature,
+            fix=fix_applied,
+            context=file_context,
+            times_used=0
+        ))
+```
+
+Common errors (missing imports, typos, config issues) get fixed instantly without an API call. Saves cost AND time.
+
+### 11.4 Explain Mode (Plan Preview)
+
+Every agent just acts. Yours can show the full plan before executing.
+
+```
+> /explain refactor the auth module to use JWT
+
+[PLAN — no changes will be made]
+1. grep_search: Find all files referencing auth/session
+   → Expect: routes using session-based auth
+2. file_read: Read src/auth/session.py
+   → Understand current implementation
+3. file_write: Create src/auth/jwt.py
+   → New JWT implementation
+4. file_edit: Update src/auth/session.py imports in 3 route files
+5. shell: Run pytest tests/test_auth.py
+   → Verify nothing broke
+
+Estimated cost: ~$0.003 (8 calls on Gemini Flash)
+Proceed? [y/n/edit]
+```
+
+---
+
+## 12. Safety & Sandboxing
 
 | Risk | Mitigation |
 |---|---|
 | `rm -rf /` or destructive commands | Blocklist regex on commands. Require user confirmation for anything matching `rm`, `drop`, `truncate`, `kill`, `mkfs`. |
 | Infinite loops | Hard cap on agent iterations (default 10). Hard timeout on subprocesses (default 30s). |
-| Token blowout | Context manager enforces budget. Large outputs truncated. |
-| Writes to wrong files | Log all file writes with full diffs. Support `--dry-run` mode that shows what would change without writing. |
+| Token blowout / cost runaway | Cost tracker with per-session budget limit (default: $0.50). Alert at 80%. Hard stop at limit. |
+| Writes to wrong files | Log all file writes with full diffs. Support `--dry-run` mode. Session snapshots enable `/rewind`. |
 | Runaway resource usage | `ulimit` on subprocess (max memory, max file size, max CPU time). |
 | Prompt injection from file contents | Keep user instructions in system prompt. Treat file contents as untrusted data in user messages. |
+| API key leakage | Keys only in env vars or `~/.cli-agent/config.toml` (chmod 600). Never logged, never in context. |
 
 **Confirmation mode** (default for sensitive ops):
 ```
@@ -409,22 +671,28 @@ Agent wants to run: rm -rf ./build/
 
 ---
 
-## 11. Config Schema
+## 13. Config Schema
 
 ```toml
 # ~/.cli-agent/config.toml
 
 [llm]
-default_provider = "ollama"          # "ollama" | "anthropic" | "openai"
-fallback_provider = "anthropic"      # Escalate on failure
+default_provider = "gemini"          # "gemini" | "deepseek" | "anthropic" | "custom"
+fallback_provider = "deepseek"       # Tier 2 escalation
+premium_provider = "anthropic"       # Tier 3 escalation
 
-[llm.ollama]
-model = "qwen3.5:4b"
-base_url = "http://localhost:11434"
+[llm.gemini]
+model = "gemini-2.0-flash"
+# api_key via GEMINI_API_KEY env var
 temperature = 0.0
-context_window = 262144              # 256K native, but keep effective use under 16K
-enable_thinking = true               # OFF by default for small models — must enable
-parallel_tool_calls = false          # Force sequential — critical for 4B reliability
+context_window = 1000000
+
+[llm.deepseek]
+model = "deepseek-chat"
+base_url = "https://api.deepseek.com"
+# api_key via DEEPSEEK_API_KEY env var
+temperature = 0.0
+context_window = 131072
 
 [llm.anthropic]
 model = "claude-sonnet-4-20250514"
@@ -432,33 +700,58 @@ model = "claude-sonnet-4-20250514"
 temperature = 0.0
 context_window = 200000
 
+[llm.custom]
+# OpenAI-compatible endpoint (Ollama, OpenRouter, Groq, Together, etc.)
+model = "qwen3.5:4b"
+base_url = "http://localhost:11434/v1"
+api_key = "ollama"
+temperature = 0.0
+context_window = 262144
+
+[router]
+escalate_after_failures = 2          # Consecutive failures before tier upgrade
+reset_on_success = true              # Reset failure counter on any success
+show_model_in_output = true          # [gemini-flash] prefix on every action
+
+[cost]
+session_budget = 0.50                # Hard stop at $0.50 per session
+alert_at_percent = 80                # Warn at 80% of budget
+log_file = "~/.cli-agent/costs.jsonl"
+
 [agent]
-max_iterations = 10                  # Max think-act cycles per request
-max_retries_per_tool = 3             # Retries on tool failure
+max_iterations = 10
+max_retries_per_tool = 3
 confirmation_required = ["rm", "drop", "kill", "truncate"]
 
 [sandbox]
 command_timeout_seconds = 30
-max_output_bytes = 20480             # 20KB — tighter for 4B attention limits
+max_output_bytes = 51200             # 50KB
 blocked_commands = ["rm -rf /", "mkfs", "dd if=/dev/zero"]
 
 [context]
-max_file_lines = 200                 # Force line ranges above this (tighter for 4B)
-summarize_threshold = 0.5            # Summarize when history hits 50% of budget
-keep_recent_messages = 4             # Never summarize the last N messages
-effective_context_target = 16384     # Aim for 16K tokens even though 256K available
+max_file_lines = 500
+summarize_threshold = 0.6
+keep_recent_messages = 4
+effective_context_target = 32768     # Target 32K regardless of model max
+
+[features]
+project_memory = true                # Persistent .agent/memory.json
+error_patterns = true                # Error pattern learning DB
+session_snapshots = true             # Time-travel checkpoints
+explain_mode = false                 # Default off, enable with /explain
 ```
 
 ---
 
-## 12. Build Phases
+## 14. Build Phases
 
-### Phase 1 — Skeleton (Day 1-2)
+### Phase 1 — Skeleton + Gemini (Day 1-2)
 - [ ] Project scaffolding, config loading, CLI entry point (`click`)
-- [ ] LLM provider abstraction + Ollama provider (just `POST /api/chat`)
+- [ ] LLM provider abstraction + Gemini provider (free tier)
 - [ ] Single tool: `shell` (execute commands, capture output)
 - [ ] Basic agent loop: prompt → LLM → tool call → execute → show result
-- [ ] **Milestone:** `agent "list all python files"` works
+- [ ] Cost tracker (counting tokens + displaying summary)
+- [ ] **Milestone:** `agent "list all python files"` works on free Gemini API
 
 ### Phase 2 — File Operations (Day 3-4)
 - [ ] `file_read`, `file_write`, `file_edit` tools
@@ -466,41 +759,57 @@ effective_context_target = 16384     # Aim for 16K tokens even though 256K avail
 - [ ] Tool registry with auto-schema generation
 - [ ] **Milestone:** `agent "read main.py and add error handling to the DB connection"` works
 
-### Phase 3 — Context & Memory (Day 5-6)
-- [ ] Token counting
+### Phase 3 — Multi-Model Router (Day 5-6)
+- [ ] DeepSeek provider
+- [ ] Anthropic provider
+- [ ] Router with failure-based escalation logic
+- [ ] Model name in terminal output `[gemini-flash]` prefix
+- [ ] **Milestone:** Agent auto-escalates to DeepSeek when Gemini fails a task
+
+### Phase 4 — Context & Memory (Day 7-8)
+- [ ] Token counting with tiktoken
 - [ ] Context window manager with sliding window + summarization
+- [ ] Project memory (`.agent/memory.json`) — load on startup, auto-learn on exit
 - [ ] Multi-turn REPL mode (persistent session)
-- [ ] **Milestone:** Agent can handle a 20-message conversation without blowing context
+- [ ] **Milestone:** Agent remembers project structure across sessions
 
-### Phase 4 — Self-Repair (Day 7-8)
-- [ ] Error recovery loop (retry with feedback)
+### Phase 5 — Self-Repair + Snapshots (Day 9-10)
+- [ ] Error recovery loop (retry with escalation)
+- [ ] Session snapshots before every edit
+- [ ] `/rewind N` command
 - [ ] Auto-run after edits (detect test runner, run it)
-- [ ] Diff-based edit verification
-- [ ] **Milestone:** `agent "fix the failing tests in tests/"` actually fixes them
+- [ ] **Milestone:** `agent "fix the failing tests"` works, and `/rewind 2` restores old state
 
-### Phase 5 — Safety & Polish (Day 9-10)
-- [ ] Command blocklist + confirmation prompts
+### Phase 6 — Polish & Ship (Day 11-12)
+- [ ] Error pattern DB (learn from fixes, skip LLM for known patterns)
+- [ ] Explain mode (`/explain` shows plan without executing)
 - [ ] `--dry-run` mode
-- [ ] Anthropic provider as fallback
-- [ ] Structured JSON logging
-- [ ] Rich terminal output (syntax-highlighted code, diff panels, spinners)
-- [ ] **Milestone:** Ship it, use it daily
+- [ ] Command blocklist + confirmation prompts
+- [ ] Rich terminal output (syntax-highlighted code, diff panels, spinners, cost display)
+- [ ] OpenAI-compatible provider (plug in Ollama, Groq, OpenRouter)
+- [ ] **Milestone:** Ship it. README headline: "costs 100x less than Claude Code."
 
 ---
 
-## 13. Critical Design Decisions
+## 15. Critical Design Decisions
 
 **1. Tool calls, not free-form parsing.**
-Don't regex-parse the LLM's prose for commands. Use the model's native tool-calling / function-calling format. Ollama supports this for Qwen and Llama models. It returns structured JSON. Parse that. This alone eliminates 80% of "agent did something weird" bugs.
+Don't regex-parse the LLM's prose for commands. Use native function-calling format. Gemini, DeepSeek, and Claude all support it. Structured JSON in, structured JSON out. This eliminates 80% of "agent did something weird" bugs.
 
 **2. Edit by replacement, not by rewrite.**
-The `file_edit` tool does `str_replace` (find exact string → replace with new string), NOT "rewrite the whole file." This prevents the LLM from accidentally dropping code, losing imports, or hallucinating functions that don't exist.
+The `file_edit` tool does `str_replace` (find exact string → replace with new string), NOT "rewrite the whole file." This prevents the LLM from accidentally dropping code, losing imports, or hallucinating functions.
 
 **3. Observe before act.**
-Hard-code into the system prompt: "ALWAYS read before edit." The #1 agent failure is editing a file the LLM has never seen, based on its assumption of what the file contains.
+Hard-code into the system prompt: "ALWAYS read before edit." The #1 agent failure is editing a file the LLM has never seen.
 
-**4. Local-first, cloud-fallback.**
-Start every request on Qwen 3.5 4B via Ollama. Escalate to Claude when the local model demonstrably fails — specifically: 2 consecutive malformed tool calls, or 3 execution failures on the same task. This keeps it fast, private, and cheap. At 4B, expect to escalate ~20–30% of complex multi-file tasks. That's fine — the goal is local for the 70% of tasks that are straightforward.
+**4. Cheap-first, smart-escalation.**
+Start every request on the free/cheapest model. Only escalate when the model demonstrably fails — not when the task "looks hard." This is a core philosophical difference from tools that always use the most expensive model.
 
 **5. Log everything.**
-Every LLM call, every tool execution, every retry — write it to a `.jsonl` file. When the agent does something stupid (and it will), you need the full trace to debug the prompt, not guess at what happened.
+Every LLM call (with model name, tokens, cost), every tool execution, every retry — write it to a `.jsonl` file. When the agent does something stupid, you need the full trace.
+
+**6. Cost is a first-class feature.**
+Display cost per session. Let users set budgets. Show which model handled each step. Make cost transparency the product's identity.
+
+**7. Provider-agnostic from day one.**
+All providers implement the same interface. Adding a new one (Groq, Together, Mistral, local Ollama) is one file. Users can bring whatever API keys they have. No vendor lock-in.
