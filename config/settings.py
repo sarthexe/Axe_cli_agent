@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import tomllib
 from pathlib import Path
-from typing import Any
 
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -108,45 +109,31 @@ class Settings(BaseSettings):
 # Loader
 # ---------------------------------------------------------------------------
 
-_DEFAULT_CONFIG = Path(__file__).parent / "default.toml"
 _USER_CONFIG = Path.home() / ".cli-agent" / "config.toml"
-
-
-def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    """Recursively merge override into base dict."""
-    merged = base.copy()
-    for key, value in override.items():
-        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
-            merged[key] = _deep_merge(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
 
 
 def load_settings(config_path: str | Path | None = None) -> Settings:
     """
-    Load settings with priority: explicit path > user config > default config.
+    Load settings with priority: explicit path > user config > code defaults.
 
-    The user config (~/.cli-agent/config.toml) is merged ON TOP of the
-    default config, so users only need to specify overrides.
+    Environment variables (including values from `.env`) are then applied.
     """
-    # 1. Load defaults
-    with open(_DEFAULT_CONFIG, "rb") as f:
-        data = tomllib.load(f)
+    # 1. Load .env values into environment for local development.
+    load_dotenv(override=False)
 
-    # 2. Merge user config if it exists
+    # 2. Load optional TOML overrides.
+    data: dict[str, object] = {}
     if config_path:
-        user_path = Path(config_path)
+        file_path = Path(config_path)
+        with open(file_path, "rb") as f:
+            data = tomllib.load(f)
     else:
-        user_path = _USER_CONFIG
+        file_path = _USER_CONFIG
+        if file_path.exists():
+            with open(file_path, "rb") as f:
+                data = tomllib.load(f)
 
-    if user_path.exists():
-        with open(user_path, "rb") as f:
-            user_data = tomllib.load(f)
-        data = _deep_merge(data, user_data)
-
-    # 3. Inject API keys from environment variables
-    import os
+    # 3. Inject API keys from environment variables.
 
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     if openai_key:

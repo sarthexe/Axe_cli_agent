@@ -15,6 +15,7 @@ dependencies = [
     "rich>=13.0",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
+    "python-dotenv>=1.0",
     "structlog>=24.0",
     "openai>=1.0",
     "tiktoken>=0.7",

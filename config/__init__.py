@@ -1,1 +1,1 @@
-# config — Settings and defaults
+# config — Settings and environment loading
