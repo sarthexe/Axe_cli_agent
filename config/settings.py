@@ -101,10 +101,11 @@ class Settings(BaseSettings):
 
 
 # Loader
+_PROJECT_CONFIG = Path(__file__).parent / "config.toml"
 
 def load_settings(config_path: str | Path | None = None) -> Settings:
     """
-    Load settings with priority: explicit path > code defaults.
+    Load settings with priority: explicit path > project config > code defaults.
 
     Environment variables (including values from `.env`) are then applied.
     """
@@ -116,6 +117,9 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
     if config_path:
         file_path = Path(config_path)
         with open(file_path, "rb") as f:
+            data = tomllib.load(f)
+    elif _PROJECT_CONFIG.exists():
+        with open(_PROJECT_CONFIG, "rb") as f:
             data = tomllib.load(f)
 
     # 3. Inject API keys from environment variables.

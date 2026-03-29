@@ -1,0 +1,46 @@
+# Project-level non-secret defaults.
+# Keep API keys in `.env`.
+
+[llm]
+default_provider = "openai"
+tier1_model = "gpt-4.1-mini"
+tier2_model = "gpt-4.1"
+tier3_model = "o3-mini"
+
+[llm.openai]
+model = "gpt-4.1-mini"
+base_url = "https://api.openai.com/v1"
+temperature = 0.0
+context_window = 128000
+
+[router]
+escalate_after_failures = 2
+reset_on_success = true
+show_model_in_output = true
+
+[cost]
+session_budget = 1.00
+alert_at_percent = 80
+log_file = "~/.cli-agent/costs.jsonl"
+
+[agent]
+max_iterations = 10
+max_retries_per_tool = 3
+confirmation_required = ["rm", "drop", "kill", "truncate"]
+
+[sandbox]
+command_timeout_seconds = 30
+max_output_bytes = 51200
+blocked_commands = ["rm -rf /", "mkfs", "dd if=/dev/zero"]
+
+[context]
+max_file_lines = 500
+summarize_threshold = 0.6
+keep_recent_messages = 4
+effective_context_target = 32768
+
+[features]
+project_memory = true
+error_patterns = true
+session_snapshots = true
+explain_mode = false
