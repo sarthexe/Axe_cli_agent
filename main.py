@@ -1,9 +1,9 @@
 """
-main.py — CLI Agent entry point.
+main.py — Axe entry point.
 
 Two modes:
-  - Single-shot: `cli-agent "do something"` — runs once and exits
-  - REPL:        `cli-agent` with no args — enters interactive loop
+  - Single-shot: `axe "do something"` — runs once and exits
+  - REPL:        `axe` with no args — enters interactive loop
 """
 
 from __future__ import annotations
@@ -51,10 +51,33 @@ console = Console(theme=THEME)
 
 def show_banner(settings: Settings) -> None:
     """Display the welcome banner with project info."""
+    from rich.align import Align
+
     banner = Text()
-    banner.append("CLI Agent", style="bold cyan")
-    banner.append(f"  v{__version__}\n", style="dim")
-    banner.append("Autonomous coding agent with intelligent multi-model routing\n\n", style="dim")
+    
+    # Beautiful ASCII Art for Axe
+    ascii_axe = (
+        "    ▄▄▄       ▀▄    ▄ ▓█████ \n"
+        "   ▒████▄       ██  ▓▒▓█   ▀ \n"
+        "   ▒██  ▀█▄   ▄███▄▄▄░▒███   \n"
+        "   ░██▄▄▄▄██ ▓█  ▀ \n"
+        "    ▓█   ▓██▒▒▒██▒ ▒ \n"
+        "    ▒▒   ▓▒█░▒ ▒░  ░ \n\n"
+    )
+    
+    # Alternatively, a cleaner standard font ASCII
+    ascii_clean = (
+        "   ___             \n"
+        "  /   | _  _____   \n"
+        " / /| || |/_/ _ \\  \n"
+        "/ ___ |_>  </  __/ \n"
+        "/_/  |_/_/|_|\\___/  \n\n"
+    )
+    
+    banner.append(ascii_clean, style="bold cyan")
+    banner.append(f"Autonomous coding agent with intelligent routing (v{__version__})\n", style="dim italic")
+    banner.append("─" * 58 + "\n\n", style="dim")
+    
     banner.append("Models: ", style="bold")
     banner.append(f"[T1] {settings.llm.tier1_model}", style="model.tier1")
     banner.append(" → ", style="dim")
@@ -66,9 +89,9 @@ def show_banner(settings: Settings) -> None:
     banner.append(f"  Max iterations: {settings.agent.max_iterations}", style="dim")
 
     console.print(Panel(
-        banner,
-        border_style="cyan",
-        title="[bold]🤖 CLI Agent[/bold]",
+        Align.center(banner),
+        border_style="bold magenta",
+        title="[bold]🪓 Axe[/bold]",
         subtitle="[dim]Type /help for commands, /exit to quit[/dim]",
         padding=(1, 2),
     ))
@@ -128,7 +151,7 @@ def handle_repl_command(command: str, settings: Settings) -> bool:
         console.print()
 
     elif cmd == "/version":
-        console.print(f"\n[info]CLI Agent v{__version__}[/info]")
+        console.print(f"\n[info]Axe v{__version__}[/info]")
         console.print(f"  Default model: {settings.llm.tier1_model}")
         console.print(f"  Python: {sys.version.split()[0]}\n")
 
@@ -263,18 +286,18 @@ def cli(
     version: bool,
 ) -> None:
     """
-    🤖 CLI Agent — Autonomous coding agent with intelligent multi-model routing.
+    🪓 Axe — Autonomous coding agent with intelligent multi-model routing.
 
     Run with a PROMPT for single-shot mode, or with no arguments for interactive REPL.
 
     \b
     Examples:
-      cli-agent "list all python files"
-      cli-agent "fix the failing tests"
-      cli-agent                          # Enter REPL mode
+      axe "list all python files"
+      axe "fix the failing tests"
+      axe                          # Enter REPL mode
     """
     if version:
-        console.print(f"CLI Agent v{__version__}")
+        console.print(f"Axe v{__version__}")
         raise SystemExit(0)
 
     # Load configuration
