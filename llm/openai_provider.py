@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from openai import OpenAI
+from openai.types.chat import ChatCompletionMessage
 
 from llm.provider import LLMProvider, LLMResponse, ToolCall
 
@@ -39,32 +40,36 @@ class OpenAIProvider(LLMProvider):
         *,
         system_prompt: str | None = None,
         tools: list[dict[str, Any]] | None = None,
+        messages: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         input_messages: list[dict[str, Any]] = []
 
-        if system_prompt:
-            input_messages.append({
-                "role": "system",
-                "content": [{"type": "input_text", "text": system_prompt}],
-            })
+        if messages is not None:
+            input_messages.extend(messages)
+        else:
+            if system_prompt:
+                input_messages.append({"role": "system", "content": system_prompt})
 
-        input_messages.append({
-            "role": "user",
-            "content": [{"type": "input_text", "text": prompt}],
-        })
+            input_messages.append({"role": "user", "content": prompt})
 
         request: dict[str, Any] = {
             "model": self.model,
-            "input": input_messages,
+            "messages": input_messages,
             "temperature": self.temperature,
         }
         if tools:
             request["tools"] = self._build_tools(tools)
 
-        response = self._client.responses.create(**request)
-        response_text = getattr(response, "output_text", "") or ""
-        tool_calls = self._extract_tool_calls(response)
-        response_raw = response.model_dump() if hasattr(response, "model_dump") else {}
+        response = self._client.chat.completions.create(**request)
+        response_message = response.choices[0].message
+        
+        response_text = response_message.content or ""
+        tool_calls = self._extract_tool_calls(response_message)
+        response_raw = response.model_dump()
+        
+        # Capture raw assistant message for tool feedback loop
+        if tool_calls:
+            response_raw["message"] = response_message.model_dump(exclude_none=True)
 
         return LLMResponse(
             text=response_text.strip(),
@@ -80,49 +85,43 @@ class OpenAIProvider(LLMProvider):
                 continue
             spec: dict[str, Any] = {
                 "type": "function",
-                "name": name,
-                "description": str(tool.get("description", "")),
+                "function": {
+                    "name": name,
+                    "description": str(tool.get("description", "")),
+                }
             }
             parameters = tool.get("parameters")
             if isinstance(parameters, dict):
-                spec["parameters"] = parameters
+                spec["function"]["parameters"] = parameters
             prepared.append(spec)
         return prepared
 
-    def _extract_tool_calls(self, response: Any) -> list[ToolCall]:
+    def _extract_tool_calls(self, message: ChatCompletionMessage) -> list[ToolCall]:
         calls: list[ToolCall] = []
-        output_items = getattr(response, "output", None)
-        if not isinstance(output_items, list):
+        if not message.tool_calls:
             return calls
 
-        for item in output_items:
-            item_type = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
-            if item_type != "function_call":
+        for item in message.tool_calls:
+            if item.type != "function":
                 continue
 
-            name = item.get("name") if isinstance(item, dict) else getattr(item, "name", "")
-            raw_arguments = (
-                item.get("arguments") if isinstance(item, dict) else getattr(item, "arguments", {})
-            )
+            name = item.function.name
+            raw_arguments = item.function.arguments
+            
             parsed_arguments: dict[str, Any] = {}
             if isinstance(raw_arguments, str):
                 try:
-                    parsed = json.loads(raw_arguments)
-                    if isinstance(parsed, dict):
-                        parsed_arguments = parsed
+                    parsed_arguments = json.loads(raw_arguments)
                 except json.JSONDecodeError:
                     parsed_arguments = {}
             elif isinstance(raw_arguments, dict):
                 parsed_arguments = raw_arguments
 
-            if isinstance(name, str) and name:
-                raw_item = item
-                if not isinstance(item, dict):
-                    raw_item = item.model_dump() if hasattr(item, "model_dump") else {}
-                calls.append(ToolCall(
-                    name=name,
-                    arguments=parsed_arguments,
-                    raw=raw_item,
-                ))
+            calls.append(ToolCall(
+                name=name,
+                arguments=parsed_arguments,
+                id=item.id,
+                raw=item.model_dump(),
+            ))
 
         return calls

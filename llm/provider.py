@@ -13,6 +13,7 @@ class ToolCall:
 
     name: str
     arguments: dict[str, Any]
+    id: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -35,6 +36,7 @@ class LLMProvider(ABC):
         *,
         system_prompt: str | None = None,
         tools: list[dict[str, Any]] | None = None,
+        messages: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         """Return a model completion for the prompt."""
         raise NotImplementedError
