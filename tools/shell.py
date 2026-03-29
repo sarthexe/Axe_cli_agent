@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
+import subprocess
 import os
 from typing import Any
 
@@ -34,54 +34,49 @@ class ShellTool(BaseTool):
         }
 
     def validate(self, arguments: dict[str, Any]) -> None:
-        cmd = arguments.get("command", "")
-        # Basic check for exact blocked commands based on sandbox settings
-        for blocked in self.sandbox.blocked_commands:
-            if blocked in cmd:
-                raise ValueError(f"Command contains blocked pattern: {blocked}")
+        pass  # We handle blocking directly in execute to return an explanatory string
 
     def execute(self, arguments: dict[str, Any]) -> str:
-        """Synchronous wrapper for asyncio shell execution."""
+        """Executes the shell command synchronously with a hard timeout."""
         command = arguments["command"]
-        return asyncio.run(self._run_async(command))
 
-    async def _run_async(self, command: str) -> str:
-        try:
-            # We combine stdout and stderr into stdout to capture all output easily
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=os.getcwd(),
-            )
-            
-            try:
-                stdout_data, _ = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=self.sandbox.command_timeout_seconds
+        # Bug 5: Explanation for blocked commands
+        for blocked in self.sandbox.blocked_commands:
+            if blocked in command:
+                return (
+                    f"[BLOCKED] The command '{command}' was blocked for safety. "
+                    f"Commands matching rm -rf, mkfs, dd, and fork bombs are not allowed. "
+                    f"If you need to delete files, use a more targeted command."
                 )
-            except asyncio.TimeoutError:
-                # Kill process tree gracefully (if possible), or just kill the shell process
-                process.kill()
-                await process.wait()
-                return f"Error: Command timed out after {self.sandbox.command_timeout_seconds} seconds."
 
-            output = stdout_data.decode(errors="replace") if stdout_data else ""
-            exit_code = process.returncode
-            
-            # Truncation logic (cap at max output bytes)
-            output_bytes = len(output.encode("utf-8"))
-            if output_bytes > self.sandbox.max_output_bytes:
-                # Cap the output based on lines, retaining the last 200 lines
-                lines = output.splitlines()
-                truncated_output = "\\n".join(lines[-200:])
-                output = f"[...truncated {output_bytes // 1024}KB, showing last 200 lines]\\n{truncated_output}"
-
-            if exit_code != 0:
-                result = f"Command exited with code {exit_code}:\\n{output}"
-                return result.strip()
-            
-            return output.strip() if output.strip() else "Process completed with no output."
-
+        try:
+            # Bug 3: Using subprocess.run to strictly enforce timeout
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=self.sandbox.command_timeout_seconds,
+                cwd=os.getcwd()
+            )
+        except subprocess.TimeoutExpired:
+            return f"[ERROR] Command timed out after {self.sandbox.command_timeout_seconds} seconds."
         except Exception as e:
             return f"Error executing shell command: {e}"
+
+        output = result.stdout + ("\n" + result.stderr if result.stderr else "")
+        exit_code = result.returncode
+
+        # Truncation logic (cap at max output bytes)
+        output_bytes = len(output.encode("utf-8"))
+        if output_bytes > self.sandbox.max_output_bytes:
+            # Cap the output based on lines, retaining the last 200 lines
+            lines = output.splitlines()
+            truncated_output = "\n".join(lines[-200:])
+            output = f"[...truncated {output_bytes // 1024}KB, showing last 200 lines]\n{truncated_output}"
+
+        if exit_code != 0:
+            res = f"Command exited with code {exit_code}:\n{output}"
+            return res.strip()
+
+        return output.strip() if output.strip() else "Process completed with no output."
