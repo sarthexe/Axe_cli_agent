@@ -62,24 +62,17 @@ def show_banner(settings: Settings) -> None:
     
     # Beautiful ASCII Art for Axe
     ascii_axe = (
-        "    ▄▄▄       ▀▄    ▄ ▓█████ \n"
-        "   ▒████▄       ██  ▓▒▓█   ▀ \n"
-        "   ▒██  ▀█▄   ▄███▄▄▄░▒███   \n"
-        "   ░██▄▄▄▄██ ▓█  ▀ \n"
-        "    ▓█   ▓██▒▒▒██▒ ▒ \n"
-        "    ▒▒   ▓▒█░▒ ▒░  ░ \n\n"
+        "   █████████                       \n"
+        "  ███▒▒▒▒▒███                      \n"
+        " ▒███    ▒███  █████ █████  ██████ \n"
+        " ▒███████████ ▒▒███ ▒▒███  ███▒▒███\n"
+        " ▒███▒▒▒▒▒███  ▒▒▒█████▒  ▒███████ \n"
+        " ▒███    ▒███   ███▒▒▒███ ▒███▒▒▒  \n"
+        " █████   █████ █████ █████▒▒██████ \n"
+        "▒▒▒▒▒   ▒▒▒▒▒ ▒▒▒▒▒ ▒▒▒▒▒  ▒▒▒▒▒▒  \n\n"
     )
     
-    # Alternatively, a cleaner standard font ASCII
-    ascii_clean = (
-        "   ___             \n"
-        "  /   | _  _____   \n"
-        " / /| || |/_/ _ \\  \n"
-        "/ ___ |_>  </  __/ \n"
-        "/_/  |_/_/|_|\\___/  \n\n"
-    )
-    
-    banner.append(ascii_clean, style="bold cyan")
+    banner.append(ascii_axe, style="bold cyan")
     banner.append(f"Autonomous coding agent with intelligent routing (v{__version__})\n", style="dim italic")
     banner.append("─" * 58 + "\n\n", style="dim")
     
@@ -203,7 +196,7 @@ def run_repl(settings: Settings, provider: OpenAIProvider) -> None:
 
     while True:
         try:
-            user_input = console.input("[prompt]❯ [/prompt]").strip()
+            user_input = input("\x01\033[1;36m\x02❯ \x01\033[0m\x02").strip()
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]Session ended.[/dim]")
             break
