@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from rich.console import Console
+from rich.markdown import Markdown
 
 from config.settings import Settings
 from llm.provider import LLMProvider
@@ -25,20 +26,18 @@ class Agent:
         self.registry = registry
         self.settings = settings
         self.console = console or Console()
+        self.messages: list[dict[str, Any]] = [
+            {"role": "system", "content": (
+                "You are Axe, a CLI coding assistant. You have access to tools to help "
+                "the user interact with their codebase and terminal. Break down your "
+                "plan into steps. When you are done, return a final summary without "
+                "calling any tools."
+            )}
+        ]
 
     def run(self, prompt: str) -> str:
         """Run the agent core loop for a user prompt."""
-        system_prompt = (
-            "You are a CLI coding assistant. You have access to tools to help "
-            "the user interact with their codebase and terminal. Break down your "
-            "plan into steps. When you are done, return a final summary without "
-            "calling any tools."
-        )
-
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
-        ]
+        self.messages.append({"role": "user", "content": prompt})
 
         for iteration in range(self.settings.agent.max_iterations):
             schemas = self.registry.get_all_schemas()
@@ -46,7 +45,7 @@ class Agent:
             with self.console.status(f"[bold blue]Calling {self.provider.model}...[/bold blue]"):
                 response = self.provider.complete(
                     prompt="",  # Ignored because messages is passed
-                    messages=messages,
+                    messages=self.messages,
                     tools=schemas if schemas else None,
                 )
 
@@ -58,10 +57,11 @@ class Agent:
             else:
                 assistant_msg = {"role": "assistant", "content": response.text}
 
-            messages.append(assistant_msg)
+            self.messages.append(assistant_msg)
 
             if response.text:
-                self.console.print(f"[bold blue][{self.provider.model}][/bold blue] {response.text}")
+                self.console.print(f"[bold blue][{self.provider.model}][/bold blue]")
+                self.console.print(Markdown(response.text))
 
             if not response.tool_calls:
                 return response.text
@@ -83,7 +83,7 @@ class Agent:
                         result = f"Error: {e}"
 
                 # Append tool result to messages
-                messages.append({
+                self.messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
                     "content": result,
