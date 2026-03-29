@@ -19,6 +19,9 @@ from rich.theme import Theme
 from config.settings import Settings, load_settings
 from llm.openai_provider import OpenAIProvider
 from utils.logger import get_logger, setup_logging
+from tools.registry import ToolRegistry
+from tools.shell import ShellTool
+from agent.core import Agent
 
 __version__ = "0.1.0"
 
@@ -166,6 +169,10 @@ def run_repl(settings: Settings, provider: OpenAIProvider) -> None:
     log = get_logger("repl")
     show_banner(settings)
 
+    registry = ToolRegistry()
+    registry.register(ShellTool(settings.sandbox))
+    agent = Agent(provider, registry, settings, console)
+
     while True:
         try:
             user_input = console.input("[prompt]❯ [/prompt]").strip()
@@ -183,19 +190,13 @@ def run_repl(settings: Settings, provider: OpenAIProvider) -> None:
                 break
             continue
 
-        # Day 1 skeleton behavior: prompt -> OpenAI -> print.
         log.info("User prompt received", prompt=user_input)
         try:
-            with console.status(f"[model.openai]Calling {provider.model}...[/model.openai]"):
-                response = provider.complete(user_input)
+            agent.run(user_input)
         except Exception as e:
-            log.error("OpenAI call failed", error=str(e))
-            console.print(f"[error]OpenAI request failed: {e}[/error]\n")
-            continue
-
-        render_model_reply(provider, response.text)
-        if response.tool_calls:
-            console.print(f"[dim]Tool calls suggested: {len(response.tool_calls)}[/dim]")
+            log.error("Agent failed", error=str(e))
+            console.print(f"[error]Agent encountered an error: {e}[/error]\n")
+        
         console.print()
 
 
@@ -203,23 +204,23 @@ def run_repl(settings: Settings, provider: OpenAIProvider) -> None:
 # Single-shot mode
 # ---------------------------------------------------------------------------
 
-def run_single_shot(prompt: str, provider: OpenAIProvider) -> None:
+def run_single_shot(prompt: str, provider: OpenAIProvider, settings: Settings) -> None:
     """Run the agent once on a single prompt, then exit."""
     log = get_logger("single_shot")
     log.info("Single-shot mode", prompt=prompt)
 
     console.print(f"\n[dim]Running:[/dim] {prompt}")
-    try:
-        with console.status(f"[model.openai]Calling {provider.model}...[/model.openai]"):
-            response = provider.complete(prompt)
-    except Exception as e:
-        log.error("OpenAI call failed", error=str(e))
-        console.print(f"[error]OpenAI request failed: {e}[/error]\n")
-        raise SystemExit(1)
+    registry = ToolRegistry()
+    registry.register(ShellTool(settings.sandbox))
+    agent = Agent(provider, registry, settings, console)
 
-    render_model_reply(provider, response.text)
-    if response.tool_calls:
-        console.print(f"[dim]Tool calls suggested: {len(response.tool_calls)}[/dim]")
+    try:
+        agent.run(prompt)
+    except Exception as e:
+        log.error("Agent execution failed", error=str(e))
+        console.print(f"[error]Agent encountered an error: {e}[/error]\n")
+        raise SystemExit(1)
+        
     console.print()
 
 
@@ -295,7 +296,7 @@ def cli(
 
     # Route to single-shot or REPL mode
     if prompt:
-        run_single_shot(prompt, provider)
+        run_single_shot(prompt, provider, settings)
     else:
         run_repl(settings, provider)
 
