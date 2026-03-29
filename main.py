@@ -10,6 +10,11 @@ from __future__ import annotations
 
 import sys
 
+try:
+    import readline
+except ImportError:
+    pass
+
 import click
 from rich.console import Console
 from rich.panel import Panel
