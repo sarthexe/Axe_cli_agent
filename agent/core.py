@@ -26,6 +26,7 @@ class Agent:
         self.registry = registry
         self.settings = settings
         self.console = console or Console()
+        self.tool_failures: dict[str, int] = {}
         self.messages: list[dict[str, Any]] = [
             {"role": "system", "content": (
                 "You are Axe, a CLI coding assistant. You have access to tools to help "
@@ -81,6 +82,15 @@ class Agent:
                         result = self.registry.dispatch(tool_call.name, tool_call.arguments)
                     except Exception as e:
                         result = f"Error: {e}"
+
+                is_error = result.startswith("Error:") or "[ERROR]" in result or "Command exited with code" in result
+                if is_error:
+                    self.tool_failures[tool_call.name] = self.tool_failures.get(tool_call.name, 0) + 1
+                    failures = self.tool_failures[tool_call.name]
+                    if failures >= self.settings.agent.max_retries_per_tool:
+                        result += f"\n\n[SYSTEM INTERVENTION] Tool '{tool_call.name}' has failed {failures} consecutive times. Stop retrying the same approach. Reflect on the error and try a completely different strategy, or ask the user for help."
+                else:
+                    self.tool_failures[tool_call.name] = 0
 
                 # Append tool result to messages
                 self.messages.append({
