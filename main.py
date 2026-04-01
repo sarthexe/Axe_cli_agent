@@ -26,6 +26,11 @@ from llm.openai_provider import OpenAIProvider
 from utils.logger import get_logger, setup_logging
 from tools.registry import ToolRegistry
 from tools.shell import ShellTool
+from tools.file_read import FileReadTool
+from tools.file_write import FileWriteTool
+from tools.file_edit import FileEditTool
+from tools.glob_search import GlobSearchTool
+from tools.grep_search import GrepSearchTool
 from agent.core import Agent
 
 __version__ = "0.1.0"
@@ -192,6 +197,11 @@ def run_repl(settings: Settings, provider: OpenAIProvider) -> None:
 
     registry = ToolRegistry()
     registry.register(ShellTool(settings.sandbox))
+    registry.register(FileReadTool(settings.context))
+    registry.register(FileWriteTool())
+    registry.register(FileEditTool())
+    registry.register(GlobSearchTool())
+    registry.register(GrepSearchTool())
     agent = Agent(provider, registry, settings, console)
 
     while True:
@@ -233,6 +243,11 @@ def run_single_shot(prompt: str, provider: OpenAIProvider, settings: Settings) -
     console.print(f"\n[dim]Running:[/dim] {prompt}")
     registry = ToolRegistry()
     registry.register(ShellTool(settings.sandbox))
+    registry.register(FileReadTool(settings.context))
+    registry.register(FileWriteTool())
+    registry.register(FileEditTool())
+    registry.register(GlobSearchTool())
+    registry.register(GrepSearchTool())
     agent = Agent(provider, registry, settings, console)
 
     try:
