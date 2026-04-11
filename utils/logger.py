@@ -8,9 +8,12 @@ utils/logger.py — Structured logging with structlog.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import structlog
 
@@ -92,3 +95,30 @@ def get_logger(name: str) -> structlog.stdlib.BoundLogger:
         log.info("Starting agent loop", iteration=1)
     """
     return structlog.get_logger(name)
+
+
+class SessionLogger:
+    """Append structured per-event records to `.agent/logs/session.jsonl`."""
+
+    def __init__(
+        self,
+        path: str | Path = ".agent/logs/session.jsonl",
+        session_id: str | None = None,
+    ) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.session_id = session_id or uuid4().hex
+
+    def log_event(self, event_type: str, **fields: object) -> None:
+        payload: dict[str, object] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "session_id": self.session_id,
+            "event_type": event_type,
+        }
+        payload.update(fields)
+        try:
+            with self.path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        except OSError:
+            # Logging should never crash the session.
+            pass
