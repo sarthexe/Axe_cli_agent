@@ -90,26 +90,46 @@ class ModelRouter:
         tools: list[dict[str, Any]] | None = None,
         messages: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
-        """Call the active model tier, escalating on API/SDK failures."""
-        try:
-            response = self._provider.complete(
-                prompt,
-                system_prompt=system_prompt,
-                tools=tools,
-                messages=messages,
-            )
-        except (
+        """Call the active model tier, escalating on API/SDK failures.
+
+        After each failure the router increments the failure counter and
+        escalates the tier if the threshold is reached.  The call is then
+        retried on the new tier automatically — the exception only propagates
+        to the caller once all tiers have been exhausted.
+        """
+        _OPENAI_ERRORS = (
             openai.APIError,
             openai.APIConnectionError,
             openai.RateLimitError,
             openai.APITimeoutError,
             openai.APIStatusError,
-        ) as exc:
-            self._on_failure(exc)
-            raise  # Let agent loop decide whether to retry
+        )
 
-        self._on_success()
-        return response
+        last_exc: Exception | None = None
+
+        # Try every tier from the current one up to the last
+        for attempt in range(self._current_tier, len(self._tiers)):
+            try:
+                response = self._provider.complete(
+                    prompt,
+                    system_prompt=system_prompt,
+                    tools=tools,
+                    messages=messages,
+                )
+                self._on_success()
+                return response
+            except _OPENAI_ERRORS as exc:
+                last_exc = exc
+                self._on_failure(exc)
+                # _on_failure may have escalated — if we're still on the same
+                # tier (threshold not yet reached), don't advance the loop
+                if self._current_tier == attempt:
+                    # Not escalated yet (below threshold) — re-raise so the
+                    # caller sees the error rather than silently retrying
+                    raise
+
+        # All tiers exhausted
+        raise last_exc  # type: ignore[misc]
 
     # ------------------------------------------------------------------
     # Tier management
