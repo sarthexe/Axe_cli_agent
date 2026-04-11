@@ -58,3 +58,6 @@ Thumbs.db
 
 # Agent local data (memory, snapshots)
 .agent/
+
+
+tests/
