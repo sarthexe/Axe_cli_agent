@@ -24,7 +24,7 @@ alert_at_percent = 80
 log_file = "~/.cli-agent/costs.jsonl"
 
 [agent]
-max_iterations = 10
+max_iterations = 25
 max_retries_per_tool = 3
 confirmation_required = ["rm", "drop", "kill", "truncate"]
 
