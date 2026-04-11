@@ -89,9 +89,14 @@ $ axe
 |---------|-------------|
 | `/cost` | Show session cost breakdown |
 | `/memory` | View/edit project memory |
+| `/rewind <step>` | Restore files from a previous snapshot |
+| `/explain <task>` | Preview a numbered execution plan with estimated cost |
 | `/clear` | Clear conversation history |
 | `Ctrl+C` | Cancel current operation |
 | `Ctrl+D` | Exit (shows session summary) |
+
+`--dry-run` mode previews actions without running shell commands or writing files.
+Session events are logged to `.agent/logs/session.jsonl`.
 
 ## Cost comparison
 
