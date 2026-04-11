@@ -14,6 +14,8 @@ from tools.registry import ToolRegistry
 if TYPE_CHECKING:
     from llm.router import ModelRouter
     from cost.tracker import CostTracker
+    from agent.context import ContextManager
+    from agent.snapshots import SnapshotManager
 
 
 class Agent:
@@ -26,28 +28,42 @@ class Agent:
         settings: Settings,
         console: Console | None = None,
         tracker: CostTracker | None = None,
+        context_manager: ContextManager | None = None,
+        snapshot_manager: SnapshotManager | None = None,
+        project_context: str = "",
     ) -> None:
         self.provider = provider
         self.registry = registry
         self.settings = settings
         self.console = console or Console()
         self.tracker = tracker
+        self.context_manager = context_manager
+        self.snapshot_manager = snapshot_manager
         self.tool_failures: dict[str, int] = {}
+
+        # Build system prompt with optional project context
+        system_content = (
+            "You are Axe, an autonomous CLI coding agent. You solve tasks by using tools — "
+            "not by asking the user questions.\n\n"
+            "RULES:\n"
+            "1. ACT, don't ask. Never say 'should I?', 'would you like me to?', or 'shall I proceed?'. "
+            "Just do it.\n"
+            "2. If a dependency is missing, install it yourself and continue.\n"
+            "3. If a command fails, read the error, fix the root cause, retry.\n"
+            "4. ALWAYS read a file before editing it. Never guess contents.\n"
+            "5. ALWAYS run code after changes to verify it works.\n"
+            "6. Use grep_search and glob_search to find files — don't guess paths.\n"
+            "7. After 3 failed attempts at the same fix, stop and explain what went wrong.\n"
+            "8. When the task is done, give a short summary of what you did. No tool calls.\n"
+            "9. When reading files, read at least 200 lines at a time (use start_line/end_line). "
+            "Never read a file 40 lines at a time — it wastes iterations. "
+            "If a file is under 500 lines, read the whole thing in one call.\n"
+        )
+        if project_context:
+            system_content += f"\n{project_context}\n"
+
         self.messages: list[dict[str, Any]] = [
-            {"role": "system", "content": (
-               "You are Axe, an autonomous CLI coding agent. You solve tasks by using tools — "
-                "not by asking the user questions.\n\n"
-                "RULES:\n"
-                "1. ACT, don't ask. Never say 'should I?', 'would you like me to?', or 'shall I proceed?'. "
-                "Just do it.\n"
-                "2. If a dependency is missing, install it yourself and continue.\n"
-                "3. If a command fails, read the error, fix the root cause, retry.\n"
-                "4. ALWAYS read a file before editing it. Never guess contents.\n"
-                "5. ALWAYS run code after changes to verify it works.\n"
-                "6. Use grep_search and glob_search to find files — don't guess paths.\n"
-                "7. After 3 failed attempts at the same fix, stop and explain what went wrong.\n"
-                "8. When the task is done, give a short summary of what you did. No tool calls.\n"
-            )}
+            {"role": "system", "content": system_content}
         ]
 
     def run(self, prompt: str) -> str:
@@ -57,20 +73,26 @@ class Agent:
         for iteration in range(self.settings.agent.max_iterations):
             schemas = self.registry.get_all_schemas()
 
+            # --- Context management: trim messages to fit token budget ---
+            if self.context_manager is not None:
+                prepared_messages = self.context_manager.prepare(self.messages)
+            else:
+                prepared_messages = self.messages
+
             # Determine display label (router-aware or plain model name)
             model_label = self._model_label()
 
             with self.console.status(f"[bold blue]Calling {model_label}...[/bold blue]"):
                 response = self.provider.complete(
                     prompt="",  # Ignored because messages is passed
-                    messages=self.messages,
+                    messages=prepared_messages,
                     tools=schemas if schemas else None,
                 )
 
             # --- Cost tracking ---
             if self.tracker is not None:
                 usage = response.raw.get("usage") if response.raw else None
-                rec = self.tracker.record(
+                self.tracker.record(
                     model=getattr(self.provider, "current_model", getattr(self.provider, "model", "unknown")),
                     usage=usage,
                 )
@@ -90,7 +112,6 @@ class Agent:
             # Record assistant generation
             assistant_msg: dict[str, Any] = {}
             if response.raw and "message" in response.raw:
-                # Retrieve raw assistant message with tool calls preserved accurately
                 assistant_msg = response.raw["message"]
             else:
                 assistant_msg = {"role": "assistant", "content": response.text}
@@ -106,13 +127,19 @@ class Agent:
 
             # Execute tools sequentially
             for tool_call in response.tool_calls:
-                # Use str() on args to prevent huge objects from breaking the UI
                 args_str = str(tool_call.arguments)
                 if len(args_str) > 100:
                     args_str = args_str[:97] + "..."
 
                 tool_label = f"{tool_call.name}({args_str})"
                 self.console.print(f"[dim]→ Tool call:[/dim] {tool_label}")
+
+                # --- Snapshot before file modifications ---
+                if self.snapshot_manager is not None and tool_call.name in ("file_edit", "file_write"):
+                    file_path = tool_call.arguments.get("path", "")
+                    if file_path:
+                        step = self.snapshot_manager.next_step()
+                        self.snapshot_manager.checkpoint(step, file_path)
 
                 with self.console.status(f"[bold cyan]Running {tool_call.name}...[/bold cyan]"):
                     try:
@@ -136,7 +163,7 @@ class Agent:
                     "content": result,
                 })
 
-                # Truncate output display for terminal, so it doesn't flood the UI
+                # Truncate output display for terminal
                 display_result = result
                 lines = display_result.splitlines()
                 if len(lines) > 15:
@@ -146,6 +173,14 @@ class Agent:
 
         self.console.print(f"[bold red]Stopped:[/bold red] Hit max iterations ({self.settings.agent.max_iterations}).")
         return "Error: Agent reached maximum iterations without completing the task."
+
+    def clear_conversation(self) -> None:
+        """Reset conversation history but keep the system prompt."""
+        system_msg = self.messages[0] if self.messages else None
+        self.messages.clear()
+        if system_msg:
+            self.messages.append(system_msg)
+        self.tool_failures.clear()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -157,7 +192,6 @@ class Agent:
 
     def _badge(self) -> str:
         """Return a Rich markup string badge for the active model/tier."""
-        # If the provider is a ModelRouter, use its formatted badge
         badge_fn = getattr(self.provider, "badge_text", None)
         if badge_fn is not None:
             return badge_fn()  # returns Rich Text
