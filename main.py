@@ -28,7 +28,8 @@ from cost.tracker import CostTracker
 from agent.context import ContextManager
 from agent.snapshots import SnapshotManager
 from project.memory import ProjectMemory
-from utils.logger import get_logger, setup_logging
+from sandbox.permissions import CommandSafety
+from utils.logger import SessionLogger, get_logger, setup_logging
 from tools.registry import ToolRegistry
 from tools.shell import ShellTool
 from tools.file_read import FileReadTool
@@ -64,7 +65,7 @@ console = Console(theme=THEME)
 # Banner
 # ---------------------------------------------------------------------------
 
-def show_banner(settings: Settings) -> None:
+def show_banner(settings: Settings, dry_run: bool = False) -> None:
     """Display the welcome banner with project info."""
     from rich.align import Align
 
@@ -95,6 +96,9 @@ def show_banner(settings: Settings) -> None:
     banner.append(f"\nBudget: ", style="bold")
     banner.append(f"${settings.cost.session_budget:.2f}/session", style="cost")
     banner.append(f"  Max iterations: {settings.agent.max_iterations}", style="dim")
+    if dry_run:
+        banner.append("\nMode: ", style="bold")
+        banner.append("DRY-RUN (no writes, no shell execution)", style="warning")
 
     console.print(Panel(
         Align.center(banner),
@@ -223,8 +227,16 @@ def handle_repl_command(command: str, settings: Settings, **kwargs: object) -> b
         console.print("\n[info]Conversation cleared. Project memory preserved.[/info]\n")
 
     elif cmd == "/explain":
-        # TODO: Integrate with ExplainMode
-        console.print("\n[warning]Explain mode — not yet implemented.[/warning]\n")
+        agent: Agent | None = kwargs.get("agent")
+        if agent is None:
+            console.print("\n[warning]Agent not available.[/warning]\n")
+        elif not args:
+            console.print("\n[warning]Usage: /explain <task>[/warning]\n")
+        else:
+            explain_text = agent.explain(" ".join(args))
+            console.print()
+            console.print(Panel(explain_text, title="Execution Preview", border_style="cyan"))
+            console.print()
 
     else:
         console.print(f"[error]Unknown command: {cmd}[/error]")
@@ -248,10 +260,15 @@ def _print_session_summary(tracker: CostTracker | None) -> None:
     console.print()
 
 
-def run_repl(settings: Settings, router: ModelRouter, tracker: CostTracker) -> None:
+def run_repl(
+    settings: Settings,
+    router: ModelRouter,
+    tracker: CostTracker,
+    dry_run: bool = False,
+) -> None:
     """Run the interactive REPL session."""
     log = get_logger("repl")
-    show_banner(settings)
+    show_banner(settings, dry_run=dry_run)
 
     # --- Project memory ---
     memory = ProjectMemory(console=console)
@@ -266,9 +283,12 @@ def run_repl(settings: Settings, router: ModelRouter, tracker: CostTracker) -> N
 
     # --- Snapshot manager ---
     snapshots = SnapshotManager(console=console)
+    safety = CommandSafety(settings.sandbox, settings.agent)
+    session_logger = SessionLogger()
+    session_logger.log_event("session_start", mode="repl", dry_run=dry_run)
 
     registry = ToolRegistry()
-    registry.register(ShellTool(settings.sandbox))
+    registry.register(ShellTool(settings.sandbox, safety=safety))
     registry.register(FileReadTool(settings.context))
     registry.register(FileWriteTool())
     registry.register(FileEditTool())
@@ -279,6 +299,9 @@ def run_repl(settings: Settings, router: ModelRouter, tracker: CostTracker) -> N
         tracker=tracker,
         context_manager=ctx_manager,
         snapshot_manager=snapshots,
+        command_safety=safety,
+        dry_run=dry_run,
+        session_logger=session_logger,
         project_context=project_context,
     )
 
@@ -288,6 +311,7 @@ def run_repl(settings: Settings, router: ModelRouter, tracker: CostTracker) -> N
         except (KeyboardInterrupt, EOFError):
             memory.save()
             _print_session_summary(tracker)
+            session_logger.log_event("session_end", mode="repl", reason="interrupt")
             break
 
         if not user_input:
@@ -302,6 +326,7 @@ def run_repl(settings: Settings, router: ModelRouter, tracker: CostTracker) -> N
             )
             if not should_continue:
                 memory.save()
+                session_logger.log_event("session_end", mode="repl", reason="command_exit")
                 break
             continue
 
@@ -324,6 +349,7 @@ def run_single_shot(
     router: ModelRouter,
     tracker: CostTracker,
     settings: Settings,
+    dry_run: bool = False,
 ) -> None:
     """Run the agent once on a single prompt, then exit."""
     log = get_logger("single_shot")
@@ -342,10 +368,14 @@ def run_single_shot(
 
     # --- Snapshot manager ---
     snapshots = SnapshotManager(console=console)
+    safety = CommandSafety(settings.sandbox, settings.agent)
+    session_logger = SessionLogger()
+    session_logger.log_event("session_start", mode="single", dry_run=dry_run)
 
-    console.print(f"\n[dim]Running:[/dim] {prompt}")
+    mode_note = " [DRY-RUN]" if dry_run else ""
+    console.print(f"\n[dim]Running{mode_note}:[/dim] {prompt}")
     registry = ToolRegistry()
-    registry.register(ShellTool(settings.sandbox))
+    registry.register(ShellTool(settings.sandbox, safety=safety))
     registry.register(FileReadTool(settings.context))
     registry.register(FileWriteTool())
     registry.register(FileEditTool())
@@ -356,6 +386,9 @@ def run_single_shot(
         tracker=tracker,
         context_manager=ctx_manager,
         snapshot_manager=snapshots,
+        command_safety=safety,
+        dry_run=dry_run,
+        session_logger=session_logger,
         project_context=project_context,
     )
 
@@ -364,10 +397,12 @@ def run_single_shot(
     except Exception as e:
         log.error("Agent execution failed", error=str(e))
         console.print(f"[error]Agent encountered an error: {e}[/error]\n")
+        session_logger.log_event("session_end", mode="single", reason="error", error=str(e))
         raise SystemExit(1)
 
     memory.save()
     _print_session_summary(tracker)
+    session_logger.log_event("session_end", mode="single", reason="done")
     console.print()
 
 
@@ -397,6 +432,12 @@ def run_single_shot(
     help="Enable verbose (DEBUG) logging.",
 )
 @click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Preview actions without modifying files or running shell commands.",
+)
+@click.option(
     "--version",
     is_flag=True,
     default=False,
@@ -407,6 +448,7 @@ def cli(
     model_override: str | None,
     config_path: str | None,
     verbose: bool,
+    dry_run: bool,
     version: bool,
 ) -> None:
     """
@@ -432,7 +474,7 @@ def cli(
         raise SystemExit(1)
 
     # Initialize logging
-    setup_logging(verbose=verbose)
+    setup_logging(verbose=verbose, log_dir=".agent/logs")
     log = get_logger("main")
     log.debug("Config loaded", provider=settings.llm.default_provider)
     try:
@@ -443,9 +485,9 @@ def cli(
 
     # Route to single-shot or REPL mode
     if prompt:
-        run_single_shot(prompt, router, tracker, settings)
+        run_single_shot(prompt, router, tracker, settings, dry_run=dry_run)
     else:
-        run_repl(settings, router, tracker)
+        run_repl(settings, router, tracker, dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------
