@@ -23,6 +23,8 @@ from rich.theme import Theme
 
 from config.settings import Settings, load_settings
 from llm.openai_provider import OpenAIProvider
+from llm.router import ModelRouter
+from cost.tracker import CostTracker
 from utils.logger import get_logger, setup_logging
 from tools.registry import ToolRegistry
 from tools.shell import ShellTool
@@ -100,21 +102,25 @@ def show_banner(settings: Settings) -> None:
     ))
 
 
-def build_openai_provider(settings: Settings, model_override: str | None = None) -> OpenAIProvider:
-    """Create an OpenAI provider instance from resolved settings."""
+def build_router_and_tracker(
+    settings: Settings,
+    model_override: str | None = None,
+) -> tuple[ModelRouter, CostTracker]:
+    """Create a ModelRouter + CostTracker pair from resolved settings."""
     openai_config = settings.llm.openai
-    return OpenAIProvider(
-        model=model_override or openai_config.model,
+    provider = OpenAIProvider(
+        model=model_override or settings.llm.tier1_model,
         api_key=openai_config.api_key,
         base_url=openai_config.base_url,
         temperature=openai_config.temperature,
     )
-
-
-def render_model_reply(provider: OpenAIProvider, reply_text: str) -> None:
-    """Render a model reply with a provider label."""
-    label = f"[{provider.model}]"
-    console.print(f"[model.openai]{label}[/model.openai] {reply_text or '[dim](empty response)[/dim]'}")
+    router = ModelRouter(provider, settings, console)
+    tracker = CostTracker(
+        session_budget=settings.cost.session_budget,
+        alert_at_percent=settings.cost.alert_at_percent,
+        log_file=settings.cost.log_file,
+    )
+    return router, tracker
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +139,7 @@ REPL_COMMANDS: dict[str, str] = {
 }
 
 
-def handle_repl_command(command: str, settings: Settings) -> bool:
+def handle_repl_command(command: str, settings: Settings, **kwargs: object) -> bool:
     """
     Handle a REPL slash-command.
 
@@ -143,8 +149,7 @@ def handle_repl_command(command: str, settings: Settings) -> bool:
     args = command.strip().split()[1:]
 
     if cmd in ("/exit", "/quit"):
-        console.print("\n[dim]Session ended.[/dim]")
-        # TODO: Show session cost summary here
+        _print_session_summary(kwargs.get("tracker"))  # type: ignore[arg-type]
         return False
 
     elif cmd == "/help":
@@ -159,9 +164,14 @@ def handle_repl_command(command: str, settings: Settings) -> bool:
         console.print(f"  Python: {sys.version.split()[0]}\n")
 
     elif cmd == "/cost":
-        # TODO: Integrate with CostTracker
-        console.print("\n[cost]Session cost: $0.0000[/cost]")
-        console.print("[dim]  Calls: gpt-4.1-mini: 0, gpt-4.1: 0, o3-mini: 0[/dim]\n")
+        tracker: CostTracker | None = kwargs.get("tracker")
+        if tracker is None or tracker.total_calls() == 0:
+            console.print("\n[dim]No LLM calls recorded yet.[/dim]\n")
+        else:
+            console.print()
+            console.print(tracker.summary_table())
+            console.print(tracker.budget_line())
+            console.print()
 
     elif cmd == "/memory":
         # TODO: Integrate with ProjectMemory
@@ -190,7 +200,18 @@ def handle_repl_command(command: str, settings: Settings) -> bool:
 # REPL Loop
 # ---------------------------------------------------------------------------
 
-def run_repl(settings: Settings, provider: OpenAIProvider) -> None:
+def _print_session_summary(tracker: CostTracker | None) -> None:
+    """Print the end-of-session cost table (if any calls were made)."""
+    if tracker is None or tracker.total_calls() == 0:
+        console.print("\n[dim]Session ended. No LLM calls were made.[/dim]")
+        return
+    console.print()
+    console.print(tracker.summary_table())
+    console.print(tracker.budget_line())
+    console.print()
+
+
+def run_repl(settings: Settings, router: ModelRouter, tracker: CostTracker) -> None:
     """Run the interactive REPL session."""
     log = get_logger("repl")
     show_banner(settings)
@@ -202,13 +223,13 @@ def run_repl(settings: Settings, provider: OpenAIProvider) -> None:
     registry.register(FileEditTool())
     registry.register(GlobSearchTool())
     registry.register(GrepSearchTool())
-    agent = Agent(provider, registry, settings, console)
+    agent = Agent(router, registry, settings, console, tracker=tracker)
 
     while True:
         try:
             user_input = input("\x01\033[1;36m\x02❯ \x01\033[0m\x02").strip()
         except (KeyboardInterrupt, EOFError):
-            console.print("\n[dim]Session ended.[/dim]")
+            _print_session_summary(tracker)
             break
 
         if not user_input:
@@ -216,7 +237,7 @@ def run_repl(settings: Settings, provider: OpenAIProvider) -> None:
 
         # Handle slash commands
         if user_input.startswith("/"):
-            should_continue = handle_repl_command(user_input, settings)
+            should_continue = handle_repl_command(user_input, settings, tracker=tracker)
             if not should_continue:
                 break
             continue
@@ -227,7 +248,7 @@ def run_repl(settings: Settings, provider: OpenAIProvider) -> None:
         except Exception as e:
             log.error("Agent failed", error=str(e))
             console.print(f"[error]Agent encountered an error: {e}[/error]\n")
-        
+
         console.print()
 
 
@@ -235,7 +256,12 @@ def run_repl(settings: Settings, provider: OpenAIProvider) -> None:
 # Single-shot mode
 # ---------------------------------------------------------------------------
 
-def run_single_shot(prompt: str, provider: OpenAIProvider, settings: Settings) -> None:
+def run_single_shot(
+    prompt: str,
+    router: ModelRouter,
+    tracker: CostTracker,
+    settings: Settings,
+) -> None:
     """Run the agent once on a single prompt, then exit."""
     log = get_logger("single_shot")
     log.info("Single-shot mode", prompt=prompt)
@@ -248,7 +274,7 @@ def run_single_shot(prompt: str, provider: OpenAIProvider, settings: Settings) -
     registry.register(FileEditTool())
     registry.register(GlobSearchTool())
     registry.register(GrepSearchTool())
-    agent = Agent(provider, registry, settings, console)
+    agent = Agent(router, registry, settings, console, tracker=tracker)
 
     try:
         agent.run(prompt)
@@ -256,7 +282,8 @@ def run_single_shot(prompt: str, provider: OpenAIProvider, settings: Settings) -
         log.error("Agent execution failed", error=str(e))
         console.print(f"[error]Agent encountered an error: {e}[/error]\n")
         raise SystemExit(1)
-        
+
+    _print_session_summary(tracker)
     console.print()
 
 
@@ -325,16 +352,16 @@ def cli(
     log = get_logger("main")
     log.debug("Config loaded", provider=settings.llm.default_provider)
     try:
-        provider = build_openai_provider(settings, model_override=model_override)
+        router, tracker = build_router_and_tracker(settings, model_override=model_override)
     except ValueError as e:
         console.print(f"[error]{e}[/error]")
         raise SystemExit(1)
 
     # Route to single-shot or REPL mode
     if prompt:
-        run_single_shot(prompt, provider, settings)
+        run_single_shot(prompt, router, tracker, settings)
     else:
-        run_repl(settings, provider)
+        run_repl(settings, router, tracker)
 
 
 # ---------------------------------------------------------------------------

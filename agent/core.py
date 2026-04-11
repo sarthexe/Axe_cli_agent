@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -10,6 +10,10 @@ from rich.markdown import Markdown
 from config.settings import Settings
 from llm.provider import LLMProvider
 from tools.registry import ToolRegistry
+
+if TYPE_CHECKING:
+    from llm.router import ModelRouter
+    from cost.tracker import CostTracker
 
 
 class Agent:
@@ -21,11 +25,13 @@ class Agent:
         registry: ToolRegistry,
         settings: Settings,
         console: Console | None = None,
+        tracker: CostTracker | None = None,
     ) -> None:
         self.provider = provider
         self.registry = registry
         self.settings = settings
         self.console = console or Console()
+        self.tracker = tracker
         self.tool_failures: dict[str, int] = {}
         self.messages: list[dict[str, Any]] = [
             {"role": "system", "content": (
@@ -51,12 +57,35 @@ class Agent:
         for iteration in range(self.settings.agent.max_iterations):
             schemas = self.registry.get_all_schemas()
 
-            with self.console.status(f"[bold blue]Calling {self.provider.model}...[/bold blue]"):
+            # Determine display label (router-aware or plain model name)
+            model_label = self._model_label()
+
+            with self.console.status(f"[bold blue]Calling {model_label}...[/bold blue]"):
                 response = self.provider.complete(
                     prompt="",  # Ignored because messages is passed
                     messages=self.messages,
                     tools=schemas if schemas else None,
                 )
+
+            # --- Cost tracking ---
+            if self.tracker is not None:
+                usage = response.raw.get("usage") if response.raw else None
+                rec = self.tracker.record(
+                    model=getattr(self.provider, "current_model", getattr(self.provider, "model", "unknown")),
+                    usage=usage,
+                )
+                if self.tracker.near_budget() and not self.tracker.over_budget():
+                    pct = self.tracker.budget_percent()
+                    self.console.print(
+                        f"[bold yellow]⚠  Budget warning:[/bold yellow] "
+                        f"[yellow]{pct:.1f}% of ${self.tracker.session_budget:.2f} used[/yellow]"
+                    )
+                if self.tracker.over_budget():
+                    self.console.print(
+                        f"[bold red]🛑 Session budget of ${self.tracker.session_budget:.2f} exceeded "
+                        f"(${self.tracker.total_cost():.4f} spent). Stopping.[/bold red]"
+                    )
+                    return "Error: Session budget exceeded."
 
             # Record assistant generation
             assistant_msg: dict[str, Any] = {}
@@ -69,7 +98,7 @@ class Agent:
             self.messages.append(assistant_msg)
 
             if response.text:
-                self.console.print(f"[bold blue][{self.provider.model}][/bold blue]")
+                self.console.print(self._badge())
                 self.console.print(Markdown(response.text))
 
             if not response.tool_calls:
@@ -81,7 +110,7 @@ class Agent:
                 args_str = str(tool_call.arguments)
                 if len(args_str) > 100:
                     args_str = args_str[:97] + "..."
-                
+
                 tool_label = f"{tool_call.name}({args_str})"
                 self.console.print(f"[dim]→ Tool call:[/dim] {tool_label}")
 
@@ -106,14 +135,31 @@ class Agent:
                     "tool_call_id": tool_call.id,
                     "content": result,
                 })
-                
+
                 # Truncate output display for terminal, so it doesn't flood the UI
                 display_result = result
                 lines = display_result.splitlines()
                 if len(lines) > 15:
                     display_result = "\\n".join(lines[:15]) + "\\n...[truncated output for display]"
-                    
+
                 self.console.print(f"[dim]← Tool result:[/dim]\\n{display_result}")
 
         self.console.print(f"[bold red]Stopped:[/bold red] Hit max iterations ({self.settings.agent.max_iterations}).")
         return "Error: Agent reached maximum iterations without completing the task."
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _model_label(self) -> str:
+        """Return a plain-text model name for status spinners."""
+        return getattr(self.provider, "current_model", getattr(self.provider, "model", "model"))
+
+    def _badge(self) -> str:
+        """Return a Rich markup string badge for the active model/tier."""
+        # If the provider is a ModelRouter, use its formatted badge
+        badge_fn = getattr(self.provider, "badge_text", None)
+        if badge_fn is not None:
+            return badge_fn()  # returns Rich Text
+        model = getattr(self.provider, "model", "model")
+        return f"[bold blue][{model}][/bold blue]"
