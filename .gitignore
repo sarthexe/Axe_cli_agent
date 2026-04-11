@@ -55,3 +55,6 @@ Thumbs.db
 
 #docs
 /docs
+
+# Agent local data (memory, snapshots)
+.agent/
