@@ -9,6 +9,7 @@ import threading
 from typing import Any
 
 from config.settings import SandboxSettings
+from sandbox.permissions import CommandSafety
 from tools.base import BaseTool
 
 
@@ -18,8 +19,13 @@ class ShellTool(BaseTool):
     name: str = "shell"
     description: str = "Executes a shell command and returns its output (stdout/stderr combined)."
 
-    def __init__(self, sandbox: SandboxSettings) -> None:
+    def __init__(
+        self,
+        sandbox: SandboxSettings,
+        safety: CommandSafety | None = None,
+    ) -> None:
         self.sandbox = sandbox
+        self.safety = safety or CommandSafety(sandbox_settings=sandbox)
 
     def parameters(self) -> dict[str, Any]:
         """Schema for the shell tool."""
@@ -40,16 +46,13 @@ class ShellTool(BaseTool):
 
     def execute(self, arguments: dict[str, Any]) -> str:
         """Executes the shell command synchronously with a hard timeout."""
-        command = arguments["command"]
+        command = str(arguments.get("command", "")).strip()
+        if not command:
+            return "Error: Missing required argument 'command'."
 
-        # Bug 5: Explanation for blocked commands
-        for blocked in self.sandbox.blocked_commands:
-            if blocked in command:
-                return (
-                    f"[BLOCKED] The command '{command}' was blocked for safety. "
-                    f"Commands matching rm -rf, mkfs, dd, and fork bombs are not allowed. "
-                    f"If you need to delete files, use a more targeted command."
-                )
+        decision = self.safety.analyze(command)
+        if decision.blocked:
+            return self.safety.blocked_message(command, decision)
 
         try:
             # Bug 3: Using subprocess.Popen with a reader thread to enforce size and timeout limits
