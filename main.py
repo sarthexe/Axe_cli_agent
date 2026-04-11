@@ -25,6 +25,9 @@ from config.settings import Settings, load_settings
 from llm.openai_provider import OpenAIProvider
 from llm.router import ModelRouter
 from cost.tracker import CostTracker
+from agent.context import ContextManager
+from agent.snapshots import SnapshotManager
+from project.memory import ProjectMemory
 from utils.logger import get_logger, setup_logging
 from tools.registry import ToolRegistry
 from tools.shell import ShellTool
@@ -133,8 +136,9 @@ REPL_COMMANDS: dict[str, str] = {
     "/quit": "Exit the agent",
     "/cost": "Show current session cost",
     "/version": "Show version info",
-    "/memory": "View/edit project memory",
+    "/memory": "View/edit project memory (e.g., /memory set language=python)",
     "/rewind": "Rewind to a previous step (e.g., /rewind 3)",
+    "/clear": "Clear conversation history (keeps memory)",
     "/explain": "Preview plan without executing",
 }
 
@@ -174,16 +178,49 @@ def handle_repl_command(command: str, settings: Settings, **kwargs: object) -> b
             console.print()
 
     elif cmd == "/memory":
-        # TODO: Integrate with ProjectMemory
-        console.print("\n[warning]Project memory not yet loaded.[/warning]\n")
+        memory: ProjectMemory | None = kwargs.get("memory")
+        if memory is None:
+            console.print("\n[warning]Project memory not available.[/warning]\n")
+        elif args and args[0] == "set" and len(args) >= 2:
+            # /memory set key=value
+            kv = " ".join(args[1:])
+            if "=" in kv:
+                key, value = kv.split("=", 1)
+                memory.update(key.strip(), value.strip())
+                console.print(f"[success]Set {key.strip()} = {value.strip()}[/success]\n")
+            else:
+                console.print("[error]Usage: /memory set key=value[/error]")
+        elif args and args[0] == "detect":
+            memory.auto_detect()
+        else:
+            console.print()
+            console.print(memory.display_table())
+            console.print()
 
     elif cmd == "/rewind":
-        step = int(args[0]) if args else None
-        if step is None:
-            console.print("[error]Usage: /rewind <step_number>[/error]")
+        snapshots: SnapshotManager | None = kwargs.get("snapshots")
+        if snapshots is None:
+            console.print("\n[warning]Snapshots not available.[/warning]\n")
+        elif not args:
+            # Show available steps
+            console.print()
+            console.print(snapshots.list_table())
+            console.print()
         else:
-            # TODO: Integrate with SnapshotManager
-            console.print(f"\n[warning]Rewind to step {step} — not yet implemented.[/warning]\n")
+            try:
+                step = int(args[0])
+            except ValueError:
+                console.print("[error]Usage: /rewind <step_number>[/error]")
+                return True
+            restored = snapshots.rewind(step)
+            if not restored:
+                console.print(f"[warning]No snapshot found for step {step}[/warning]")
+
+    elif cmd == "/clear":
+        agent: Agent | None = kwargs.get("agent")
+        if agent is not None:
+            agent.clear_conversation()
+        console.print("\n[info]Conversation cleared. Project memory preserved.[/info]\n")
 
     elif cmd == "/explain":
         # TODO: Integrate with ExplainMode
@@ -216,6 +253,20 @@ def run_repl(settings: Settings, router: ModelRouter, tracker: CostTracker) -> N
     log = get_logger("repl")
     show_banner(settings)
 
+    # --- Project memory ---
+    memory = ProjectMemory(console=console)
+    memory.load()
+    if not memory.data:
+        memory.auto_detect()
+    project_context = memory.to_system_context()
+
+    # --- Context manager ---
+    ctx_manager = ContextManager(settings.context, console=console)
+    ctx_manager.set_provider(router)
+
+    # --- Snapshot manager ---
+    snapshots = SnapshotManager(console=console)
+
     registry = ToolRegistry()
     registry.register(ShellTool(settings.sandbox))
     registry.register(FileReadTool(settings.context))
@@ -223,12 +274,19 @@ def run_repl(settings: Settings, router: ModelRouter, tracker: CostTracker) -> N
     registry.register(FileEditTool())
     registry.register(GlobSearchTool())
     registry.register(GrepSearchTool())
-    agent = Agent(router, registry, settings, console, tracker=tracker)
+    agent = Agent(
+        router, registry, settings, console,
+        tracker=tracker,
+        context_manager=ctx_manager,
+        snapshot_manager=snapshots,
+        project_context=project_context,
+    )
 
     while True:
         try:
             user_input = input("\x01\033[1;36m\x02❯ \x01\033[0m\x02").strip()
         except (KeyboardInterrupt, EOFError):
+            memory.save()
             _print_session_summary(tracker)
             break
 
@@ -237,8 +295,13 @@ def run_repl(settings: Settings, router: ModelRouter, tracker: CostTracker) -> N
 
         # Handle slash commands
         if user_input.startswith("/"):
-            should_continue = handle_repl_command(user_input, settings, tracker=tracker)
+            should_continue = handle_repl_command(
+                user_input, settings,
+                tracker=tracker, memory=memory,
+                snapshots=snapshots, agent=agent,
+            )
             if not should_continue:
+                memory.save()
                 break
             continue
 
@@ -266,6 +329,20 @@ def run_single_shot(
     log = get_logger("single_shot")
     log.info("Single-shot mode", prompt=prompt)
 
+    # --- Project memory ---
+    memory = ProjectMemory(console=console)
+    memory.load()
+    if not memory.data:
+        memory.auto_detect()
+    project_context = memory.to_system_context()
+
+    # --- Context manager ---
+    ctx_manager = ContextManager(settings.context, console=console)
+    ctx_manager.set_provider(router)
+
+    # --- Snapshot manager ---
+    snapshots = SnapshotManager(console=console)
+
     console.print(f"\n[dim]Running:[/dim] {prompt}")
     registry = ToolRegistry()
     registry.register(ShellTool(settings.sandbox))
@@ -274,7 +351,13 @@ def run_single_shot(
     registry.register(FileEditTool())
     registry.register(GlobSearchTool())
     registry.register(GrepSearchTool())
-    agent = Agent(router, registry, settings, console, tracker=tracker)
+    agent = Agent(
+        router, registry, settings, console,
+        tracker=tracker,
+        context_manager=ctx_manager,
+        snapshot_manager=snapshots,
+        project_context=project_context,
+    )
 
     try:
         agent.run(prompt)
@@ -283,6 +366,7 @@ def run_single_shot(
         console.print(f"[error]Agent encountered an error: {e}[/error]\n")
         raise SystemExit(1)
 
+    memory.save()
     _print_session_summary(tracker)
     console.print()
 
