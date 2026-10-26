@@ -1,0 +1,143 @@
+# Axe bundled defaults.
+#
+# This file is loaded first, then overridden (in order) by:
+#   1. ~/.config/axe/config.toml          (user global)
+#   2. <repo_root>/.axe/config.toml       (workspace local)
+#   3. AXE_* environment variables        (highest priority)
+#
+# Never commit API keys here. Set them in .env or your shell environment.
+
+[general]
+project_memory_file = ".axe/memory.json"
+max_iterations = 25
+snapshot_before_edit = true
+
+# ---------------------------------------------------------------------------
+# Open-weight providers (all OpenAI-compatible except Ollama, which Phase 2
+# adapts through its native /api/chat endpoint).
+# ---------------------------------------------------------------------------
+
+[providers]
+default = "openrouter"
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[providers.deepseek]
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[providers.zhipu]
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[providers.moonshot]
+base_url = "https://api.moonshot.cn/v1"
+api_key_env = "MOONSHOT_API_KEY"
+
+[providers.fireworks]
+base_url = "https://api.fireworks.ai/inference/v1"
+api_key_env = "FIREWORKS_API_KEY"
+
+[providers.local_vllm]
+base_url = "http://localhost:8000/v1"
+api_key_env = "VLLM_API_KEY"
+
+[providers.llamacpp]
+base_url = "http://localhost:8080/v1"
+api_key_env = "LLAMACPP_API_KEY"
+
+[providers.ollama]
+base_url = "http://localhost:11434"
+
+# ---------------------------------------------------------------------------
+# Jev decision model + open-weight routing tiers
+# ---------------------------------------------------------------------------
+
+[router]
+escalate_after_failures = 2
+reset_on_success = true
+show_model_in_output = true
+
+[router.jev]
+enabled = true
+provider = "openrouter"
+model = "typesafe/jev-latest"
+endpoint = "https://openrouter.ai/api/v1/evaluate"
+api_key_env = "JEV_API_KEY"
+confidence_threshold = 0.75
+risk_gate_threshold = 0.65
+ast_compression_threshold = 0.80
+timeout_ms = 500
+
+[router.tiers]
+default_fallback = "coder"
+
+[router.tiers.fast]
+models = ["qwen/qwen3-coder-next", "zhipu/glm-5.3-flash", "ollama/qwen3-coder:14b"]
+thinking_mode = "off"
+max_tokens = 4096
+
+[router.tiers.coder]
+models = ["deepseek/deepseek-v4", "qwen/qwen3.8-27b"]
+thinking_mode = "low"
+max_tokens = 8192
+
+[router.tiers.architect]
+models = ["deepseek/deepseek-v4-pro", "moonshot/kimi-k3"]
+thinking_mode = "high"
+max_tokens = 16384
+
+[router.tiers.security]
+models = ["zhipu/glm-5.3"]
+thinking_mode = "medium"
+max_tokens = 8192
+
+# ---------------------------------------------------------------------------
+# Code-Airlock security middleware (Phase 4 wires this into the tool loop)
+# ---------------------------------------------------------------------------
+
+[security.airlock]
+enabled = true
+default_mcp_enabled = true
+mcp_command = "code-airlock"
+mcp_args = ["mcp", "serve"]
+redact_outbound_context = true
+restore_on_file_write = true
+guided_remediation_mode = "interactive" # "interactive" | "strict_block" | "warn"
+pre_commit_exclude_globs = [] # e.g. ["docs/*", "**/fixtures/*"]
+
+# ---------------------------------------------------------------------------
+# Session cost + execution limits
+# ---------------------------------------------------------------------------
+
+[cost]
+session_budget = 1.00
+alert_at_percent = 80
+log_file = "~/.config/axe/costs.jsonl"
+
+[agent]
+max_retries_per_tool = 3
+confirmation_required = ["rm", "drop", "kill", "truncate"]
+
+[sandbox]
+command_timeout_seconds = 30
+max_output_bytes = 51200
+blocked_commands = ["rm -rf /", "mkfs", "dd if=/dev/zero"]
+
+[context]
+max_file_lines = 500
+summarize_threshold = 0.6
+keep_recent_messages = 4
+effective_context_target = 32768
+
+[features]
+project_memory = true
+error_patterns = true
+session_snapshots = true
+explain_mode = false

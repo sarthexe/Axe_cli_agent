@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "axe-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Axe: Autonomous CLI agent with intelligent multi-model routing — costs 100x less than Claude Code"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,7 +18,9 @@ dependencies = [
     "python-dotenv>=1.0",
     "structlog>=24.0",
     "openai>=1.0",
+    "httpx>=0.27",
     "tiktoken>=0.7",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -28,8 +30,29 @@ dev = [
     "ruff>=0.4",
 ]
 
+# uv installs this group by default (so `uv sync` + `uv run pytest` just works).
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
 [project.scripts]
-axe = "main:cli"
+axe = "axe.cli.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/axe"]
+include = ["src/axe/**/*.py", "src/axe/**/*.toml"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/axe",
+    "tests",
+    "README.md",
+    "pyproject.toml",
+    ".env.example",
+]
 
 [tool.ruff]
 target-version = "py311"
@@ -38,7 +61,4 @@ line-length = 100
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-
-[tool.hatch.build.targets.wheel]
-packages = ["agent", "config", "cost", "llm", "project", "sandbox", "tools", "utils"]
-include = ["main.py"]
+pythonpath = ["src"]
